@@ -1,0 +1,12 @@
+streamlit
+numpy
+scipy
+pandas
+soundfile
+librosa
+torch
+transformers
+speechbrain
+scikit-learn
+matplotlib
+lime
