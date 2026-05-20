@@ -58,6 +58,7 @@ from manipulations import (
     apply_pipeline,
 )
 from session import init_state
+from acoustic_analysis import render_acoustic_tab
 from utils import (
     audio_to_bytes,
     duration_bin,
@@ -1129,7 +1130,11 @@ def render_inspection() -> None:
             st.success("Auditory annotation saved.")
 
     with tab_acoust:
-        pass
+        render_acoustic_tab(
+            target_audio=audio,
+            target_sr=sr,
+            target_name=name,
+        )
 
     with tab_det:
         if st.button("Run detection on target", type="primary"):
