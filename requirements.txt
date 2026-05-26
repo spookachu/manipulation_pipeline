@@ -10,3 +10,4 @@ speechbrain
 scikit-learn
 matplotlib
 lime
+praat-parselmouth

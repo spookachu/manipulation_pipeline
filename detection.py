@@ -1,23 +1,21 @@
-"""
-Deepfake speech detection — model loading, inference, result types,
-and score caching.
+"""Deepfake speech detection — model loading, inference, score caching, and metrics.
 
-The countermeasure (CM) score is defined as:
+Responsibilities
+----------------
+- ModelSpec registry: static descriptions of supported detection models.
+- Model loading: lazy-loaded via HuggingFace Transformers / pipeline API.
+- Inference: predict() and predict_batch() score audio arrays with any
+  registered model, returning DetectionResult objects.
+- Score caching: score_and_cache() runs inference over a corpus and writes
+  crash-safe incremental JSON caches; load_cache() reads them back.
+- Detection metrics: EER, DET curve, Cllr — self-contained, no dependency
+  on background_model.py.
+
+The countermeasure (CM) score convention throughout is:
 
     cm_score = logit[synthetic] - logit[bonafide]
 
-Higher values indicate stronger synthetic evidence.
-
-Score caching
--------------
-Background-model scores are expensive to compute across a full dataset.
-score_and_cache runs inference on a list of utterances and writes
-results to a JSON cache file in a crash-safe partial-write pattern.
-load_cache reads one or more cache files and merges them into a
-unified scores dict for downstream LR computation.
-pipeline_cache_key produces a deterministic string identifier for a
-manipulation pipeline, used to name M-BM cache files distinctly from the
-unmanipulated BM cache.
+Higher values indicate stronger evidence of synthetic speech.
 """
 
 import hashlib
@@ -28,7 +26,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from math import gcd
 from pathlib import Path
-from typing import Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import soundfile as sf
@@ -567,6 +565,7 @@ def score_and_cache(
     threshold:      float = 0.5,
     max_duration_s: float = 30.0,
     existing_scores: Optional[Dict[str, dict]] = None,
+    uid_splits:     Optional[Dict[str, str]] = None,
     progress_cb:    Optional[Callable[[int, int], None]] = None,
 ) -> Dict[str, dict]:
     """Score *uids* with *model_key* and persist results to *cache_dir*.
@@ -598,6 +597,10 @@ def score_and_cache(
         Audio is truncated to this length before inference.
     existing_scores:
         Pre-loaded scores dict to resume from. UIDs present here are skipped.
+    uid_splits:
+        Optional mapping of UID -> 'train' or 'test'. When provided, each
+        scored entry is tagged with its correct split so load_cache can
+        filter accurately.
     progress_cb:
         Optional callback(completed, total) where total = len(uids).
 
@@ -646,8 +649,9 @@ def score_and_cache(
         if audio.ndim > 1:
             audio = audio.mean(axis=1)
 
-        utt = utterances.get(uid)
-        gt  = utt.effective_label if utt else "unknown"
+        utt   = utterances.get(uid)
+        gt    = utt.effective_label if utt else "unknown"
+        split = (uid_splits or {}).get(uid, "train")
 
         # Run inference.
         try:
@@ -659,7 +663,7 @@ def score_and_cache(
             )
             for r in results:
                 if not r.error:
-                    scores_out[uid] = {"cm": r.cm_score, "gt": gt, "split": "train"}
+                    scores_out[uid] = {"cm": r.cm_score, "gt": gt, "split": split}
         except Exception as exc:
             logger.warning("score_and_cache: inference error for %r: %s", uid, exc)
 
@@ -759,10 +763,22 @@ def load_cache(
 
 
 def cache_status(
-    dataset_key: str,
-    cache_dir:   Path,
+    dataset_key:  str,
+    cache_dir:    Path,
+    expected_n:   Optional[int] = None,
 ) -> List[dict]:
     """Return a status row for each registered model's cache file.
+
+    Parameters
+    ----------
+    dataset_key:
+        Registry key of the dataset.
+    cache_dir:
+        Directory containing cache files.
+    expected_n:
+        If provided, a complete cache is only marked is_complete=True when
+        it contains at least this many entries. Useful to detect runs that
+        finished fewer files than requested (e.g. due to inference errors).
 
     Returns
     -------
@@ -778,14 +794,17 @@ def cache_status(
 
         if cache_file.exists():
             try:
-                meta = json.loads(cache_file.read_text())
+                meta    = json.loads(cache_file.read_text())
+                n_files = len(meta.get("scores", {}))
+                # A file is only truly complete if it meets the expected count.
+                complete = (expected_n is None) or (n_files >= expected_n)
                 rows.append({
                     "model_key":    spec.key,
                     "display_name": spec.display_name,
-                    "status":       "complete",
-                    "n_files":      len(meta.get("scores", {})),
+                    "status":       "complete" if complete else "partial",
+                    "n_files":      n_files,
                     "scored_at":    meta.get("scored_at", "unknown"),
-                    "is_complete":  True,
+                    "is_complete":  complete,
                 })
             except Exception:
                 rows.append(_missing_status_row(spec, "corrupt"))
