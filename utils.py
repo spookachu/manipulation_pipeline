@@ -151,271 +151,68 @@ def waveform_player(
     audio: np.ndarray,
     sr: int,
     label: str | None = None,
-    height: int = 52,
 ) -> None:
-    """Render an interactive waveform player via st.components.v1.html.
-
-    Encodes *audio* as a 16-bit WAV data URI and mounts a self-contained
-    Web Audio API player with a seekable waveform canvas. No external
-    dependencies or temporary files are used.
+    """Render a waveform plot and audio player.
 
     Parameters
     ----------
-    audio:
-        Mono float32 waveform array.
-    sr:
+    audio : np.ndarray
+        Mono float32 waveform array. Values should lie in [-1, 1];
+        samples outside this range will appear beyond the clipping
+        threshold markers.
+    sr : int
         Sample rate in Hz.
-    label:
-        Optional text shown top-left of the player.
-    height:
-        Canvas height in pixels (default 52).
+    label : str or None, optional
+        Short caption displayed above the waveform. Typically used to
+        distinguish 'Original' from 'Processed' in side-by-side views.
+        Defaults to None (no caption rendered).
+
+    Notes
+    -----
+    Time axis granularity
+        Tick spacing adapts automatically to file duration:
+        ≤ 5 s  -> 0.1 s ticks
+        ≤ 30 s -> 0.5 s ticks
+        > 30 s -> 1 s ticks
     """
-    import streamlit.components.v1 as components
+  
+    import streamlit as st
+    import matplotlib.pyplot as plt
+    import matplotlib.ticker as ticker
 
-    wav_bytes  = audio_to_bytes(audio, sr)
-    b64        = base64.b64encode(wav_bytes).decode()
-    data_uri   = f"data:audio/wav;base64,{b64}"
+    if label:
+        st.caption(label)
 
-    label_html = (
-        f'<span style="font-size:10px;color:#888;letter-spacing:0.06em;text-transform:uppercase;">'
-        f'{label}</span>'
-        if label else '<span></span>'
-    )
+    duration_s = len(audio) / sr
+    times = np.linspace(0, duration_s, num=len(audio))
 
-    download_html = ""
+    fig, ax = plt.subplots(figsize=(8, 1.6))
+    ax.plot(times, audio, color="#1a1a1a", linewidth=0.5, alpha=0.85)
+    ax.set_xlim(0, duration_s)
+    ax.set_ylim(-1.05, 1.05)
+    ax.set_xlabel("Time (s)", fontsize=7)
+    ax.set_ylabel("Amplitude", fontsize=7)
+    ax.tick_params(labelsize=6)
+    ax.yaxis.set_major_locator(ticker.MultipleLocator(0.5))
 
-    html = f"""
-<div style="background:#fff;border:1px solid #e0e0e0;border-radius:8px;
-            padding:10px 14px 8px;font-family:'Courier New',monospace;
-            box-shadow:0 1px 3px rgba(0,0,0,0.06);">
-  <div style="display:flex;align-items:center;justify-content:space-between;
-              margin-bottom:7px;min-height:18px;">
-    {label_html}
-    {download_html}
-  </div>
-  <canvas id="wc" height="{height}"
-          style="width:100%;height:{height}px;display:block;cursor:pointer;border-radius:4px;">
-  </canvas>
-  <div style="display:flex;align-items:center;gap:10px;margin-top:6px;">
-    <button id="pb"
-            style="background:none;border:none;padding:0;cursor:pointer;
-                   width:28px;height:28px;display:flex;align-items:center;
-                   justify-content:center;border-radius:50%;transition:background 0.12s;"
-            onmouseover="this.style.background='#f0f0f0';"
-            onmouseout="this.style.background='none';">
-    </button>
-    <span id="tm" style="font-size:11px;color:#888;font-variant-numeric:tabular-nums;
-                          letter-spacing:0.03em;">0:00 / 0:00</span>
-    <span id="ld" style="font-size:10px;color:#bbb;margin-left:auto;">loading…</span>
-  </div>
-</div>
+    if duration_s <= 5:
+        ax.xaxis.set_major_locator(ticker.MultipleLocator(0.1))
+    elif duration_s <= 30:
+        ax.xaxis.set_major_locator(ticker.MultipleLocator(0.5))
+    else:
+        ax.xaxis.set_major_locator(ticker.MultipleLocator(1))
 
-<script>
-(function () {{
-  const DATA_URI    = "{data_uri}";
-  const ACCENT      = "#1a1a1a";
-  const canvas      = document.getElementById("wc");
-  const playBtn     = document.getElementById("pb");
-  const timeEl      = document.getElementById("tm");
-  const loadingEl   = document.getElementById("ld");
+    ax.axhline(0, color="#ccc", linewidth=0.4, zorder=0)
+    ax.axhline(1.0,  color="#f88", linewidth=0.4, linestyle="--", zorder=0)
+    ax.axhline(-1.0, color="#f88", linewidth=0.4, linestyle="--", zorder=0)
+    ax.grid(axis="x", color="#eee", linewidth=0.4, zorder=0)
+    for sp in ("top", "right"):
+        ax.spines[sp].set_visible(False)
+    for sp in ("left", "bottom"):
+        ax.spines[sp].set_edgecolor("#ccc")
 
-  let audioCtx      = null;
-  let audioBuffer   = null;
-  let sourceNode    = null;
-  let startTime     = 0;
-  let pauseOffset   = 0;
-  let playing       = false;
-  let rafId         = null;
-  let hoverFrac     = null;
+    fig.tight_layout(pad=0.4)
+    st.pyplot(fig, width="stretch")
+    plt.close(fig)
 
-  // ── Icons ────────────────────────────────────────────────────────────────
-  function setIcon(isPlaying) {{
-    playBtn.innerHTML = isPlaying
-      ? `<svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-           <rect x="2"   y="1.5" width="3.5" height="11" rx="1" fill="#333"/>
-           <rect x="8.5" y="1.5" width="3.5" height="11" rx="1" fill="#333"/>
-         </svg>`
-      : `<svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-           <path d="M3 1.5 L12 7 L3 12.5 Z" fill="#333"/>
-         </svg>`;
-  }}
-  setIcon(false);
-
-  // ── Time formatter ────────────────────────────────────────────────────────
-  function fmt(s) {{
-    const m = Math.floor(s / 60);
-    return m + ":" + String(Math.floor(s % 60)).padStart(2, "0");
-  }}
-
-  function updateTime(currentS) {{
-    const dur = audioBuffer ? audioBuffer.duration : 0;
-    timeEl.textContent = fmt(currentS) + " / " + fmt(dur);
-  }}
-
-  // ── Waveform drawing ──────────────────────────────────────────────────────
-  function currentFrac() {{
-    if (!audioBuffer) return 0;
-    if (!playing)     return pauseOffset / audioBuffer.duration;
-    return Math.min(1, (audioCtx.currentTime - startTime) / audioBuffer.duration);
-  }}
-
-  function draw(overrideFrac) {{
-    const dpr  = window.devicePixelRatio || 1;
-    const W    = canvas.offsetWidth;
-    const H    = {height};
-
-    if (canvas.width !== W * dpr || canvas.height !== H * dpr) {{
-      canvas.width  = W * dpr;
-      canvas.height = H * dpr;
-    }}
-
-    const ctx  = canvas.getContext("2d");
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, W, H);
-
-    // Background
-    ctx.fillStyle = "#f8f8f8";
-    ctx.beginPath();
-    ctx.roundRect(0, 0, W, H, 4);
-    ctx.fill();
-
-    if (!audioBuffer) {{
-      ctx.strokeStyle = "#ddd";
-      ctx.lineWidth   = 1;
-      ctx.beginPath();
-      ctx.moveTo(0, H / 2);
-      ctx.lineTo(W, H / 2);
-      ctx.stroke();
-      return;
-    }}
-
-    const frac    = overrideFrac !== undefined ? overrideFrac : currentFrac();
-    const playedX = frac * W;
-    const hoverX  = hoverFrac !== null ? hoverFrac * W : null;
-    const data    = audioBuffer.getChannelData(0);
-    const nBars   = Math.floor(W / 3);
-    const step    = Math.max(1, Math.floor(data.length / nBars));
-    const midY    = H / 2;
-
-    for (let i = 0; i < nBars; i++) {{
-      const x   = i * (W / nBars);
-      let   sum = 0;
-      const s0  = i * step;
-      for (let j = s0; j < s0 + step && j < data.length; j++) {{
-        sum += data[j] * data[j];
-      }}
-      const rms  = Math.sqrt(sum / step);
-      const barH = Math.max(2, rms * H * 2.8);
-      const bw   = Math.max(1, W / nBars - 1.2);
-
-      if (hoverX !== null && x <= hoverX) {{
-        ctx.fillStyle = ACCENT + "55";
-      }} else if (x <= playedX) {{
-        ctx.fillStyle = ACCENT;
-      }} else {{
-        ctx.fillStyle = "#d0d0d0";
-      }}
-
-      ctx.beginPath();
-      ctx.roundRect(x, midY - barH / 2, bw, barH, 1.5);
-      ctx.fill();
-    }}
-
-    // Playhead
-    if (frac > 0) {{
-      ctx.strokeStyle = ACCENT;
-      ctx.lineWidth   = 1.5;
-      ctx.beginPath();
-      ctx.moveTo(playedX, 0);
-      ctx.lineTo(playedX, H);
-      ctx.stroke();
-    }}
-  }}
-
-  // ── Animation loop ────────────────────────────────────────────────────────
-  function animLoop() {{
-    if (!playing) return;
-    const frac = currentFrac();
-    draw(frac);
-    updateTime(frac * audioBuffer.duration);
-    rafId = requestAnimationFrame(animLoop);
-  }}
-
-  // ── Playback ──────────────────────────────────────────────────────────────
-  function play() {{
-    if (!audioBuffer || playing) return;
-    if (audioCtx.state === "suspended") audioCtx.resume();
-    sourceNode           = audioCtx.createBufferSource();
-    sourceNode.buffer    = audioBuffer;
-    sourceNode.connect(audioCtx.destination);
-    sourceNode.onended   = () => {{ if (playing) onEnded(); }};
-    sourceNode.start(0, pauseOffset);
-    startTime = audioCtx.currentTime - pauseOffset;
-    playing   = true;
-    setIcon(true);
-    animLoop();
-  }}
-
-  function pause() {{
-    if (!playing) return;
-    pauseOffset          = audioCtx.currentTime - startTime;
-    sourceNode.onended   = null;
-    sourceNode.stop();
-    playing = false;
-    cancelAnimationFrame(rafId);
-    setIcon(false);
-    draw();
-  }}
-
-  function onEnded() {{
-    playing     = false;
-    pauseOffset = 0;
-    cancelAnimationFrame(rafId);
-    setIcon(false);
-    draw(0);
-    updateTime(0);
-  }}
-
-  // ── Seek ──────────────────────────────────────────────────────────────────
-  function seek(e) {{
-    if (!audioBuffer) return;
-    const rect    = canvas.getBoundingClientRect();
-    const frac    = (e.clientX - rect.left) / rect.width;
-    const seekTo  = frac * audioBuffer.duration;
-    const wasPlay = playing;
-    if (wasPlay) {{ sourceNode.onended = null; sourceNode.stop(); playing = false; }}
-    pauseOffset = seekTo;
-    draw(frac);
-    updateTime(seekTo);
-    if (wasPlay) play();
-  }}
-
-  // ── Event listeners ───────────────────────────────────────────────────────
-  playBtn.addEventListener("click", () => {{ playing ? pause() : play(); }});
-  canvas.addEventListener("click",      seek);
-  canvas.addEventListener("mousemove",  e => {{
-    const rect = canvas.getBoundingClientRect();
-    hoverFrac  = (e.clientX - rect.left) / rect.width;
-    draw();
-  }});
-  canvas.addEventListener("mouseleave", () => {{ hoverFrac = null; draw(); }});
-
-  // ── Fetch and decode ──────────────────────────────────────────────────────
-  (async function () {{
-    try {{
-      const resp   = await fetch(DATA_URI);
-      const arrBuf = await resp.arrayBuffer();
-      audioCtx     = new (window.AudioContext || window.webkitAudioContext)();
-      audioBuffer  = await audioCtx.decodeAudioData(arrBuf);
-      loadingEl.textContent = "";
-      updateTime(0);
-      draw();
-    }} catch (err) {{
-      loadingEl.textContent = "error";
-      console.error("waveform_player: decode failed", err);
-    }}
-  }})();
-}})();
-</script>
-"""
-    components.html(html, height=height + 90)
+    st.audio(audio_to_bytes(audio, sr), format="audio/wav")
