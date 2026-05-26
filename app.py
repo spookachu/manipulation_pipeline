@@ -1323,7 +1323,8 @@ def render_inspection() -> None:
             st.success("Auditory annotation saved.")
 
     with tab_acoust:
-        pass
+        from acoustic_analysis import render_acoustic_tab
+        render_acoustic_tab(audio, sr, name)
 
     with tab_det:
         if st.button("Run detection on target", type="primary"):
