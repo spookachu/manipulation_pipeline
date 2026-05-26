@@ -148,9 +148,11 @@ def load_wav_bytes(data: bytes) -> Tuple[np.ndarray, int]:
     return audio, sr
 
 def waveform_player(
-    audio: np.ndarray,
-    sr: int,
-    label: str | None = None,
+    audio:    np.ndarray,
+    sr:       int,
+    label:    str | None = None,
+    height:   int = 52,
+    flags:    list | None = None,
 ) -> None:
     """Render a waveform plot and audio player.
 
@@ -163,9 +165,15 @@ def waveform_player(
     sr : int
         Sample rate in Hz.
     label : str or None, optional
-        Short caption displayed above the waveform. Typically used to
-        distinguish 'Original' from 'Processed' in side-by-side views.
+        Short caption displayed above the waveform.
         Defaults to None (no caption rendered).
+    segments : list of dict or None, optional
+        Analyst-marked suspicious regions. Each dict must have keys
+        'start' and 'end' (float, seconds). Rendered as semi-transparent
+        blue spans on the waveform.
+    flags : list of dict or None, optional
+        Analyst-marked suspicious timestamps. Each dict must have key
+        'time' (float, seconds). Rendered as vertical orange lines.
 
     Notes
     -----
@@ -175,7 +183,6 @@ def waveform_player(
         ≤ 30 s -> 0.5 s ticks
         > 30 s -> 1 s ticks
     """
-  
     import streamlit as st
     import matplotlib.pyplot as plt
     import matplotlib.ticker as ticker
@@ -193,7 +200,11 @@ def waveform_player(
     ax.set_xlabel("Time (s)", fontsize=7)
     ax.set_ylabel("Amplitude", fontsize=7)
     ax.tick_params(labelsize=6)
-    ax.yaxis.set_major_locator(ticker.MultipleLocator(0.5))
+    if flags:
+      ax.yaxis.set_visible(False)
+      ax.spines["left"].set_visible(False)
+    else:
+      ax.yaxis.set_major_locator(ticker.MultipleLocator(0.5))
 
     if duration_s <= 5:
         ax.xaxis.set_major_locator(ticker.MultipleLocator(0.1))
@@ -202,10 +213,30 @@ def waveform_player(
     else:
         ax.xaxis.set_major_locator(ticker.MultipleLocator(1))
 
-    ax.axhline(0, color="#ccc", linewidth=0.4, zorder=0)
-    ax.axhline(1.0,  color="#f88", linewidth=0.4, linestyle="--", zorder=0)
+    ax.axhline(0,    color="#ccc", linewidth=0.4, zorder=0)
+    ax.axhline( 1.0, color="#f88", linewidth=0.4, linestyle="--", zorder=0)
     ax.axhline(-1.0, color="#f88", linewidth=0.4, linestyle="--", zorder=0)
     ax.grid(axis="x", color="#eee", linewidth=0.4, zorder=0)
+
+    # Flag overlays
+    if flags:
+        for flag in flags:
+            ax.axvline(
+                flag["time"],
+                color=(1.0, 0.6, 0.0),
+                linewidth=1.2,
+                linestyle="--",
+                zorder=3,
+            )
+            ax.text(
+                flag["time"], 0.70,
+                f"{flag['time']:.2f}s",
+                ha="center", va="top", fontsize=5.5,
+                color=(0.85, 0.45, 0.0),
+                transform=ax.get_xaxis_transform(),
+                zorder=4,
+            )
+
     for sp in ("top", "right"):
         ax.spines[sp].set_visible(False)
     for sp in ("left", "bottom"):
