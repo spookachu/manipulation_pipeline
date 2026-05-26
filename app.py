@@ -1201,18 +1201,20 @@ def render_inspection() -> None:
     st.caption("Upload the target audio. Inspect, listen, and annotate suspected manipulations.")
 
     f = st.file_uploader("Upload target audio", type=["wav", "flac", "mp3"], key="insp_up")
-    if f is not None:
+    if f is not None and f.name != st.session_state.get("_insp_last_filename", ""):
         audio, sr = load_wav_bytes(f.read())
-        st.session_state.insp_audio      = audio
-        st.session_state.insp_sr         = sr
-        st.session_state.insp_name       = Path(f.name).stem
-        st.session_state.insp_det        = {}
-        st.session_state.insp_windowed   = {}
-        st.session_state.insp_occlusion  = {}
-        st.session_state.insp_acoustic   = {}
-        st.session_state.insp_auditory   = {}
-        st.session_state.insp_transcript = None
-        st.session_state.insp_lime       = {}
+        st.session_state.insp_audio           = audio
+        st.session_state.insp_sr              = sr
+        st.session_state.insp_name            = Path(f.name).stem
+        st.session_state._insp_last_filename  = f.name
+        st.session_state.insp_det             = {}
+        st.session_state.insp_windowed        = {}
+        st.session_state.insp_acoustic        = {}
+        st.session_state.insp_auditory        = {}
+        st.session_state.insp_transcript      = None
+        st.session_state.insp_lime            = {}
+        st.session_state.insp_lime_result     = {}
+        st.session_state.insp_det_annotation  = {}
 
     audio = st.session_state.insp_audio
     if audio is None:
@@ -1234,7 +1236,7 @@ def render_inspection() -> None:
         unsafe_allow_html=True,
     )
 
-    tab_acoust, tab_aud, tab_det = st.tabs(["Acoustic Analysis", "Auditory Analysis", "Detection"])
+    tab_acoust, tab_aud, tab_det = st.tabs(["Acoustic Analysis", "Auditory Analysis", "Synthetic Content Analysis"])
 
     with tab_aud:
         st.caption(
@@ -1327,36 +1329,8 @@ def render_inspection() -> None:
         render_acoustic_tab(audio, sr, name)
 
     with tab_det:
-        if st.button("Run detection on target", type="primary"):
-            if not insp_models:
-                st.warning("Select models in the sidebar.")
-            else:
-                with st.spinner("Running..."):
-                    results = predict(
-                        audio, sr,
-                        model_keys=insp_models, threshold=insp_thr,
-                        max_duration_s=len(audio) / sr + 1,
-                    )
-                st.session_state.insp_det = {r.model_key: r for r in results}
-
-        for mk, r in st.session_state.insp_det.items():
-            spec  = next((s for s in MODEL_SPECS if s.key == mk), None)
-            dname = spec.display_name if spec else mk
-            if r.error:
-                st.error(f"{dname}: {r.error}")
-                continue
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Model",      dname)
-            c2.metric("Synth prob", round(r.spoof_prob, 4))
-            c3.metric("CM score",   round(r.cm_score,   4))
-            c4.markdown(
-                f"**Prediction:** <span style='color:"
-                f"{'#ff4f4f' if r.prediction == 'synthetic' else '#3ddc84'};"
-                f"font-weight:bold;'>{r.prediction.upper()}</span>",
-                unsafe_allow_html=True,
-            )
-            if r.low_confidence:
-                st.warning(f"Low confidence — audio shorter than {WINDOW_S:.1f} s minimum.", icon="⚠️")
+        from synth_content_analysis import render_synthetic_content_tab
+        render_synthetic_content_tab(audio, sr, name, insp_models, insp_thr)      
 
 
 # ---------------------------------------------------------------------------
