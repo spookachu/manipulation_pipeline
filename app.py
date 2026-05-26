@@ -32,7 +32,16 @@ from background_model import (
     compute_decision_threshold,
     evaluate_hypothesis_shift,
 )
-from datasets import DATASET_REGISTRY, get_dataset
+from config import (
+    apply_path_overrides,
+    _clean_path,
+    load_path_overrides_from_session,
+    _PLACEHOLDER_PREFIX,
+)
+from datasets import (
+    DATASET_REGISTRY,
+    get_dataset,
+)
 from detection import (
     CACHE_BATCH_SIZE,
     MODEL_SPECS,
@@ -58,14 +67,9 @@ from manipulations import (
     apply_pipeline,
 )
 from session import init_state
-from acoustic_analysis import render_acoustic_tab
 from utils import (
     audio_to_bytes,
-    duration_bin,
-    generation_model as get_generation_model,
     load_wav_bytes,
-    n_synth_segs_bin,
-    parse_label_file,
     waveform_player,
 )
 
@@ -73,10 +77,6 @@ logger = logging.getLogger(__name__)
 
 st.set_page_config(page_title="Voice Deepfake Forensics", layout="wide")
 init_state()
-
-# Re-apply any user-supplied path overrides on every rerun (they are stored
-# in session state so they survive st.rerun(), but module-level patches do not).
-from config import load_path_overrides_from_session
 load_path_overrides_from_session()
 
 CACHE_DIR = Path(__file__).parent / "cache"
@@ -326,14 +326,17 @@ def run_mbm_scoring(pipeline_steps, cache_key, model_keys_to_run, selected_key, 
 
         for i, uid in enumerate(to_score):
             try:
-                raw_audio, raw_sr = sf.read(str(wav_index[uid]), dtype="float32", always_2d=False)
+                import io as _io
+                with open(str(wav_index[uid]), "rb") as _fh:
+                    _buf = _io.BytesIO(_fh.read())
+                raw_audio, raw_sr = sf.read(_buf, dtype="float32", always_2d=False)
+                if raw_audio.ndim > 1:
+                    raw_audio = raw_audio.mean(axis=1)
             except Exception as exc:
                 logger.warning("MBM: cannot read %s: %s", uid, exc)
                 prog.progress((i + 1) / len(to_score))
                 continue
-            if raw_audio.ndim > 1:
-                raw_audio = raw_audio.mean(axis=1)
-
+            
             utt     = utterances.get(uid)
             gt      = utt.effective_label if utt else "unknown"
             uid_idx = bm_uids.index(uid)
@@ -532,7 +535,7 @@ def kde_plot(scores_by_label: dict, suspect_cm: float = None, title: str = "", t
         ax.axvline(suspect_cm, color="#000000", linewidth=1.8, linestyle="--", label="target", zorder=5)
 
     ax.set_title(title, fontsize=9, pad=4)
-    ax.set_xlabel("CM score  [log-odds of synthetic]", fontsize=8)
+    ax.set_xlabel("CM score", fontsize=8)
     ax.set_ylabel("Density", fontsize=8)
     ax.tick_params(labelsize=7)
     for sp in ax.spines.values():
@@ -544,8 +547,8 @@ def kde_plot(scores_by_label: dict, suspect_cm: float = None, title: str = "", t
         return fig
 
 
-def render_cache_status_table(dataset_key: str, model_filter: list = None) -> tuple:
-    rows = cache_status(dataset_key, CACHE_DIR)
+def render_cache_status_table(dataset_key: str, model_filter: list = None, expected_n: int = None) -> tuple:
+    rows = cache_status(dataset_key, CACHE_DIR, expected_n=expected_n)
     if model_filter is not None:
         rows = [r for r in rows if r["model_key"] in model_filter]
     display_rows = [
@@ -562,16 +565,34 @@ def render_cache_status_table(dataset_key: str, model_filter: list = None) -> tu
     return rows, missing_keys
 
 
-def stratified_sample(scoreable: list, utterances: dict, pct: int, seed: int) -> list:
-    """Return a stratified pct% sample of scoreable UIDs."""
+def stratified_sample(scoreable: list, utterances: dict, pct: int, seed: int,
+                      strat_spec=None) -> list:
+    """Return a stratified pct% sample of scoreable UIDs.
+
+    Parameters
+    ----------
+    scoreable:
+        List of UIDs to sample from.
+    utterances:
+        Dict mapping UID -> Utterance.
+    pct:
+        Target percentage of *scoreable* to return (1-100).
+    seed:
+        Random seed for reproducibility.
+    strat_spec:
+        A :class:`datasets.StratificationSpec` instance that defines the
+        stratum key for this dataset. 
+    """
     flat_strata: dict = {}
     for uid in scoreable:
         utt = utterances.get(uid)
         if utt is None:
             continue
-        n_syn = sum(1 for s in utt.segments if s.label != "bonafide")
-        key   = (utt.effective_label, get_generation_model(uid), duration_bin(utt.duration), n_synth_segs_bin(n_syn))
+        key = strat_spec.stratum_key(utt) if strat_spec is not None else (utt.effective_label,)
         flat_strata.setdefault(key, []).append(uid)
+
+    if not flat_strata:
+        return []
 
     n_target    = round(len(scoreable) * pct / 100)
     sorted_keys = sorted(flat_strata.keys())
@@ -615,42 +636,64 @@ def render_database() -> None:
     tab_ds, tab_bm = st.tabs(["Datasets", "Background Model"])
 
     with tab_ds:
-        st.subheader("Select dataset")
+        st.subheader("Select datasets")
         ds_options = [ds.key for ds in DATASET_REGISTRY]
         ds_labels  = {ds.key: ds.display_name for ds in DATASET_REGISTRY}
 
-        selected_key = st.selectbox(
-            "Dataset", ds_options,
+        if "selected_datasets" not in st.session_state:
+            st.session_state.selected_datasets = (
+                [st.session_state.selected_dataset]
+                if st.session_state.selected_dataset in ds_options
+                else ds_options[:1]
+            )
+
+        selected_keys = st.multiselect(
+            "Datasets",
+            options=ds_options,
+            default=st.session_state.selected_datasets,
             format_func=lambda k: ds_labels[k],
-            index=(
-                ds_options.index(st.session_state.selected_dataset)
-                if st.session_state.selected_dataset in ds_options else 0
-            ),
             key="ds_selector",
         )
-        if selected_key != st.session_state.selected_dataset:
-            st.session_state.selected_dataset = selected_key
-            st.session_state.audio_store      = {}
-            st.session_state.db_cm_scores     = {}
-            st.session_state.utterances       = {}
-            st.session_state.cache_status     = {}
+        if not selected_keys:
+            st.info("Select at least one dataset.")
+            return
+
+        if selected_keys != st.session_state.selected_datasets:
+            st.session_state.selected_datasets = selected_keys
+            st.session_state.selected_dataset  = selected_keys[-1]
+            st.session_state.audio_store       = {}
+            st.session_state.db_cm_scores      = {}
+            st.session_state.utterances        = {}
+            st.session_state.cache_status      = {}
             st.rerun()
+        elif not st.session_state.selected_dataset:
+            st.session_state.selected_dataset = selected_keys[-1]
 
-        ds = get_dataset(selected_key)
+        selected_specs = [get_dataset(k) for k in selected_keys]
+        st.session_state["_bm_selected_keys"] = selected_keys 
 
-        #  Path setup (shown when any dataset still has placeholder paths) 
-        from config import paths_configured, apply_path_overrides, _clean_path
-        if not paths_configured():
+        def _ds_paths_configured(spec) -> bool:
+            overrides   = st.session_state.get("path_overrides", {})
+            audio_dir   = overrides.get(spec.key, {}).get("audio_dir",   spec.audio_dir)
+            label_files = overrides.get(spec.key, {}).get("label_files", spec.label_files)
+            return (
+                not audio_dir.startswith(_PLACEHOLDER_PREFIX)
+                and not any(lf.startswith(_PLACEHOLDER_PREFIX) for lf in label_files)
+            )
+
+        unconfigured = [s for s in selected_specs if not _ds_paths_configured(s)]
+        if unconfigured:
+            names = ", ".join(s.display_name for s in unconfigured)
             st.warning(
-                "**Paths not configured.** "
-                "Enter your local dataset paths below. "
+                f"**Paths not configured for: {names}.** "
+                "Enter your local paths below. "
                 "They will be used for this session only — "
                 "edit `config.py` to make them permanent.",
                 icon="📂",
             )
             with st.form("path_setup_form"):
                 form_values = {}
-                for spec in DATASET_REGISTRY:
+                for spec in unconfigured:
                     st.markdown(f"**{spec.display_name}**")
                     audio_val = st.text_input(
                         "Audio directory",
@@ -676,7 +719,7 @@ def render_database() -> None:
 
             if submitted:
                 missing = []
-                for spec in DATASET_REGISTRY:
+                for spec in unconfigured:
                     vals = form_values[spec.key]
                     if not vals["audio_dir"].strip():
                         missing.append(f"{spec.display_name} audio directory")
@@ -688,37 +731,41 @@ def render_database() -> None:
                 if missing:
                     st.error("Please fill in: " + ", ".join(missing))
                 else:
-                    overrides = {
-                        spec.key: {
+                    overrides = dict(st.session_state.get("path_overrides", {}))
+                    for spec in unconfigured:
+                        overrides[spec.key] = {
                             "audio_dir":   _clean_path(form_values[spec.key]["audio_dir"]),
                             "label_files": [_clean_path(lf) for lf in form_values[spec.key]["label_files"]],
                         }
-                        for spec in DATASET_REGISTRY
-                    }
                     overrides["__soundscape__"] = _clean_path(soundscape_val)
                     apply_path_overrides(overrides)
                     st.success("Paths applied for this session.")
                     st.rerun()
             return
 
-        with st.expander("Dataset info", expanded=True):
-            col_i1, col_i2 = st.columns([3, 1])
-            col_i1.markdown(f"**{ds.display_name}**")
-            col_i1.caption(ds.description)
-            col_i1.markdown(f"**License:** {ds.license}")
-            col_i1.markdown(f"**Citation:** {ds.citation}")
-            if ds.exists():
-                col_i2.success("Paths OK")
-            else:
-                col_i2.error("Path not found")
-                st.error("Audio dir or label file not found. Check paths in `config.py`.")
-                return
+        # Dataset info 
+        all_utterances: dict = {}
+        for ds in selected_specs:
+            with st.expander(f"**{ds.display_name}**", expanded=len(selected_specs) == 1):
+                col_i1, col_i2 = st.columns([3, 1])
+                col_i1.caption(ds.description)
+                col_i1.markdown(f"**License:** {ds.license}")
+                col_i1.markdown(f"**Citation:** {ds.citation}")
+                if ds.exists():
+                    col_i2.success("Paths OK")
+                else:
+                    col_i2.error("Path not found")
+                    st.error(f"Audio dir or label file not found for {ds.display_name}.")
+                    continue
 
-        if not st.session_state.utterances:
-            for lp in ds.label_paths():
-                st.session_state.utterances.update(parse_label_file(lp))
+            cache_key = f"utterances_{ds.key}"
+            if cache_key not in st.session_state:
+                st.session_state[cache_key] = ds.load_utterances()
+            all_utterances.update(st.session_state[cache_key])
 
-        utterances = st.session_state.utterances
+        st.session_state.utterances = all_utterances
+        utterances = all_utterances
+
         if not utterances:
             st.warning("No utterances loaded from label files.")
             return
@@ -726,35 +773,58 @@ def render_database() -> None:
         n_bonafide  = sum(1 for u in utterances.values() if u.effective_label == "bonafide")
         n_synthetic = sum(1 for u in utterances.values() if u.effective_label == "synthetic")
         n_partial   = sum(1 for u in utterances.values() if u.effective_label == "partial synthetic")
-        tts_models  = sorted({
-            get_generation_model(u.uid) for u in utterances.values()
-            if get_generation_model(u.uid) != "bonafide"
-        })
 
         col_l1, col_l2, col_l3, col_l4 = st.columns(4)
         col_l1.metric("Total utterances", len(utterances))
         col_l2.metric("Bonafide",          n_bonafide)
         col_l3.metric("Synthetic",         n_synthetic)
         col_l4.metric("Partial synthetic", n_partial)
-        with st.expander(f"TTS models ({len(tts_models)})"):
-            st.write(", ".join(tts_models))
+
+        # Per-dataset summary panels
+        for ds in selected_specs:
+            ds_utts = st.session_state.get(f"utterances_{ds.key}", {})
+            if not ds_utts:
+                continue
+            spec = ds.strat_spec
+            if spec is None:
+                continue
+            for strat_field in spec.fields:
+                values = sorted({strat_field.extractor(u) for u in ds_utts.values()
+                                 if strat_field.extractor(u) not in ("bonafide", "unknown")})
+                if values:
+                    with st.expander(f"{ds.display_name} — {strat_field.name} ({len(values)})"):
+                        st.write(", ".join(values))
 
         st.divider()
         st.subheader("Precomputed scores")
-        st.caption("Scores are cached per model in `cache/`. Only missing models need to be computed.")
+        st.caption("Scores are cached per dataset per model in `cache/`.")
 
-        _, missing_keys = render_cache_status_table(selected_key)
+        # Scoring and cache status per dataset.
+        all_missing_keys = set()
+        for ds in selected_specs:
+            st.markdown(f"**{ds.display_name}**")
+            ds_utterances = st.session_state.get(f"utterances_{ds.key}", {})
+            expected_n = None
+            if ds_utterances:
+                try:
+                    train_uids_check, _ = ds.compute_bm_split(ds_utterances, CACHE_DIR)
+                    wav_index_check = get_wav_index(ds, ds.key)
+                    expected_n = sum(1 for uid in train_uids_check if uid in wav_index_check)
+                except Exception:
+                    pass
+            _, missing_keys = render_cache_status_table(ds.key, expected_n=expected_n)
+            all_missing_keys.update(missing_keys)
 
         col_btn1, col_btn2 = st.columns(2)
         compute_missing = col_btn1.button(
-            f"Compute missing ({len(missing_keys)} model{'s' if len(missing_keys) != 1 else ''})",
-            type="primary", disabled=len(missing_keys) == 0,
+            f"Compute missing ({len(all_missing_keys)} model{'s' if len(all_missing_keys) != 1 else ''})",
+            type="primary", disabled=len(all_missing_keys) == 0,
         )
         recompute_all = col_btn2.button("Recompute all", disabled=len(MODEL_SPECS) == 0)
 
         models_to_run = []
         if compute_missing:
-            models_to_run = missing_keys
+            models_to_run = list(all_missing_keys)
         elif recompute_all:
             models_to_run = [s.key for s in MODEL_SPECS]
 
@@ -764,62 +834,82 @@ def render_database() -> None:
             cache_sample_seed = col_ss.number_input("Seed", 0, value=42, key="cache_sample_seed")
 
         if models_to_run:
-            train_uids, _ = ds.compute_bm_split(utterances, CACHE_DIR)
-            wav_index     = {p.stem: p for p in ds.audio_path().rglob(f"*.{ds.audio_ext}")}
-            scoreable     = [uid for uid in train_uids if uid in wav_index]
-
-            if cache_sample_pct < 100:
-                scoreable = stratified_sample(scoreable, utterances, cache_sample_pct, int(cache_sample_seed))
-
-            for model_key in models_to_run:
-                spec     = next(s for s in MODEL_SPECS if s.key == model_key)
-                existing = {}
-                for candidate in (
-                    CACHE_DIR / f"{selected_key}_{model_key}.json",
-                    CACHE_DIR / f"{selected_key}_{model_key}.partial.json",
-                ):
-                    if candidate.exists():
-                        try:
-                            existing = json.loads(candidate.read_text()).get("scores", {})
-                        except Exception:
-                            existing = {}
-                        break
-
-                scoreable_set  = set(scoreable)
-                valid_existing = {uid: v for uid, v in existing.items() if uid in scoreable_set}
-                to_score       = [uid for uid in scoreable if uid not in valid_existing]
-
-                if not to_score:
-                    st.caption(f"{spec.display_name} — nothing new to score.")
+            for ds in selected_specs:
+                ds_utterances = st.session_state.get(f"utterances_{ds.key}", {})
+                if not ds_utterances:
                     continue
+                st.markdown(f"**Scoring: {ds.display_name}**")
+                train_uids, test_uids = ds.compute_bm_split(ds_utterances, CACHE_DIR)
+                uid_splits = {uid: "train" for uid in train_uids}
+                uid_splits.update({uid: "test" for uid in test_uids})
 
-                st.caption(
-                    f"{spec.display_name} — scoring {len(to_score)} / {len(scoreable)} files "
-                    f"({len(valid_existing)} already cached for this sample)."
-                )
-                prog_sc = st.progress(0)
-                stat_sc = st.empty()
+                wav_index = get_wav_index(ds, ds.key)
+                scoreable = [uid for uid in train_uids if uid in wav_index]
 
-                score_and_cache(
-                    uids=to_score, wav_index=wav_index, utterances=utterances,
-                    dataset_key=selected_key, model_key=model_key, cache_dir=CACHE_DIR,
-                    existing_scores=valid_existing,
-                    progress_cb=lambda done, total: (
-                        prog_sc.progress(done / total),
-                        stat_sc.caption(f"{spec.display_name} — {done}/{total} files scored"),
-                    ),
-                )
-                stat_sc.success(f"{spec.display_name} — scoring complete.")
+                if cache_sample_pct < 100:
+                    scoreable = stratified_sample(scoreable, ds_utterances, cache_sample_pct, int(cache_sample_seed),
+                                                  strat_spec=ds.strat_spec)
+
+                for model_key in models_to_run:
+                    spec     = next(s for s in MODEL_SPECS if s.key == model_key)
+                    existing = {}
+                    for candidate in (
+                        CACHE_DIR / f"{ds.key}_{model_key}.json",
+                        CACHE_DIR / f"{ds.key}_{model_key}.partial.json",
+                    ):
+                        if candidate.exists():
+                            try:
+                                existing = json.loads(candidate.read_text()).get("scores", {})
+                            except Exception:
+                                existing = {}
+                            break
+
+                    scoreable_set  = set(scoreable)
+                    valid_existing = {uid: v for uid, v in existing.items() if uid in scoreable_set}
+                    to_score       = [uid for uid in scoreable if uid not in valid_existing]
+
+                    if not to_score:
+                        st.caption(f"{spec.display_name} / {ds.display_name} — nothing new to score.")
+                        continue
+
+                    st.caption(
+                        f"{spec.display_name} — scoring {len(to_score)} / {len(scoreable)} files "
+                        f"({len(valid_existing)} already cached)."
+                    )
+                    prog_sc = st.progress(0)
+                    stat_sc = st.empty()
+
+                    score_and_cache(
+                        uids=to_score, wav_index=wav_index, utterances=ds_utterances,
+                        dataset_key=ds.key, model_key=model_key, cache_dir=CACHE_DIR,
+                        existing_scores=valid_existing,
+                        uid_splits=uid_splits,
+                        progress_cb=lambda done, total: (
+                            prog_sc.progress(done / total),
+                            stat_sc.caption(f"{spec.display_name} — {done}/{total} files scored"),
+                        ),
+                    )
+                    stat_sc.success(f"{spec.display_name} / {ds.display_name} — scoring complete.")
 
             st.session_state.cache_status = {}
             st.rerun()
 
-        st.session_state.db_cm_scores = load_cache(selected_key, CACHE_DIR)
+        # Pool cm_scores across all selected datasets.
+        pooled_scores = {}
+        for ds in selected_specs:
+            pooled_scores.update(load_cache(ds.key, CACHE_DIR))
+        st.session_state.db_cm_scores = pooled_scores
 
     with tab_bm:
         if not st.session_state.db_cm_scores:
             st.warning("No scored files found. Use the Datasets tab to compute scores.")
             return
+
+        _bm_keys   = st.session_state.get("_bm_selected_keys", [])
+        if not _bm_keys:
+            st.info("Select datasets in the Datasets tab first.")
+            return
+        selected_specs = [get_dataset(k) for k in _bm_keys]
 
         bm_models = st.multiselect(
             "Models", [s.key for s in MODEL_SPECS],
@@ -833,17 +923,32 @@ def render_database() -> None:
         for spec in active_specs:
             nat_cm, syn_cm = [], []
             file_scores    = {}
+
+            uid_to_ds: dict = {}
+            for ds_candidate in selected_specs:
+                for cuid in st.session_state.get(f"utterances_{ds_candidate.key}", {}):
+                    uid_to_ds[cuid] = ds_candidate       
+
+            per_ds_nat: dict = {ds_s.key: [] for ds_s in selected_specs}
+            per_ds_syn: dict = {ds_s.key: [] for ds_s in selected_specs}
+
             for uid, entries in st.session_state.db_cm_scores.items():
                 for e in entries:
                     if e.get("model") != spec.key:
                         continue
                     gt, cm = e["gt"], e["cm"]
+                    ds_spec = uid_to_ds.get(uid)          
+                    ds_key  = ds_spec.key if ds_spec else None 
                     if gt == "bonafide":
                         nat_cm.append(cm)
                         file_scores[uid] = {"cm": cm, "label": "bonafide"}
+                        if ds_key and ds_key in per_ds_nat:
+                            per_ds_nat[ds_key].append(cm)
                     elif gt in ("synthetic", "partial synthetic"):
                         syn_cm.append(cm)
                         file_scores[uid] = {"cm": cm, "label": "synthetic"}
+                        if ds_key and ds_key in per_ds_syn:
+                            per_ds_syn[ds_key].append(cm)
 
             st.markdown(f"**{spec.display_name}**")
             st.caption(
@@ -895,7 +1000,7 @@ def render_database() -> None:
                 )
 
             ax.set_title(f"Background Model — {spec.display_name}", fontsize=10)
-            ax.set_xlabel("CM score  [log-odds of synthetic]", fontsize=8)
+            ax.set_xlabel("CM score", fontsize=8)
             ax.set_ylabel("Density", fontsize=8)
             ax.tick_params(labelsize=7)
             ax.legend(fontsize=7)
@@ -931,7 +1036,8 @@ def render_database() -> None:
             with st.expander("Performance & fairness breakdown", expanded=False):
                 threshold = 0.0
                 utt_store = st.session_state.utterances
-                bk_rows   = []
+
+                per_ds_rows: dict = {ds_s.key: [] for ds_s in selected_specs}
 
                 for uid, entries in st.session_state.db_cm_scores.items():
                     for e in entries:
@@ -939,6 +1045,9 @@ def render_database() -> None:
                             continue
                         utt = utt_store.get(uid)
                         if utt is None:
+                            continue
+                        ds_for_uid = uid_to_ds.get(uid)
+                        if ds_for_uid is None:
                             continue
                         n_segs     = len(utt.segments)
                         n_syn_segs = sum(1 for s in utt.segments if s.label != "bonafide")
@@ -950,43 +1059,127 @@ def render_database() -> None:
                         cm   = float(e["cm"])
                         pred = 1 if cm >= threshold else 0
                         gt   = 0 if utt.effective_label == "bonafide" else 1
-                        bk_rows.append({
-                            "uid":            uid,
-                            "cm":             cm,
-                            "pred":           pred,
-                            "gt":             gt,
-                            "gt_fine":        utt.effective_label,
-                            "pct_syn":        pct_syn,
-                            "dur_bin":        duration_bin(utt.duration),
-                            "gen_model":      get_generation_model(uid),
-                            "n_syn_segs_bin": n_synth_segs_bin(n_syn_segs),
-                        })
+                        row  = {
+                            "uid":     uid,
+                            "cm":      cm,
+                            "pred":    pred,
+                            "gt":      gt,
+                            "gt_fine": utt.effective_label,
+                            "pct_syn": pct_syn,
+                        }
+                        if ds_for_uid.strat_spec is not None:
+                            for strat_field in ds_for_uid.strat_spec.fields:
+                                row[strat_field.name] = strat_field.extractor(utt)
+                        per_ds_rows[ds_for_uid.key].append(row)
 
-                if not bk_rows:
-                    st.caption("No scored utterances found in session.")
-                else:
-                    pct_order  = ["0% — bonafide", "1-49%", "50-99%", "100% — fully synthetic"]
-                    dur_order  = ["short", "medium", "long"]
-                    nsyn_order = ["0", "1-3", "3+"]
+                pct_order = ["0% — bonafide", "1-49%", "50-99%", "100% — fully synthetic"]
 
-                    tab_gen, tab_pct, tab_dur, tab_nsyn = st.tabs([
-                        "TTS Model", "% Synthetic", "Duration", "N Synthetic Segments"
-                    ])
-                    with tab_gen:
-                        st.caption("Statistical parity by TTS generation model.")
-                        stat_parity_table(bk_rows, lambda r: r["gen_model"], "TTS model")
-                    with tab_pct:
+                for ds_s in selected_specs:
+                    bk_rows = per_ds_rows[ds_s.key]
+                    if not bk_rows:
+                        st.caption(f"{ds_s.display_name}: no scored utterances found.")
+                        continue
+
+                    st.markdown(f"**{ds_s.display_name}**")
+
+                    ds_field_names: list = []
+                    if ds_s.strat_spec is not None:
+                        for strat_field in ds_s.strat_spec.fields:
+                            ds_field_names.append(strat_field.name)
+
+                    tab_labels = ["% Synthetic"] + ds_field_names
+                    tabs = st.tabs(tab_labels)
+
+                    with tabs[0]:
                         st.caption("Statistical parity by fraction of utterance that is synthetic.")
-                        stat_parity_table(bk_rows, lambda r: pct_syn_bucket(r["pct_syn"]), "% Synthetic", order=pct_order)
-                    with tab_dur:
-                        st.caption("Statistical parity by utterance duration.")
-                        stat_parity_table(bk_rows, lambda r: r["dur_bin"], "Duration", order=dur_order, show_class_counts=True)
-                    with tab_nsyn:
-                        st.caption("Statistical parity by number of synthetic segments.")
-                        stat_parity_table(bk_rows, lambda r: r["n_syn_segs_bin"], "N syn segs", order=nsyn_order)
+                        stat_parity_table(bk_rows, lambda r: pct_syn_bucket(r["pct_syn"]),
+                                          "% Synthetic", order=pct_order)
 
-            st.divider()
+                    for tab_widget, field_name in zip(tabs[1:], ds_field_names):
+                        with tab_widget:
+                            st.caption(f"Statistical parity by {field_name} ({ds_s.display_name}).")
+                            field_rows = [r for r in bk_rows if field_name in r]
+                            if field_rows:
+                                stat_parity_table(field_rows,
+                                                  lambda r, fn=field_name: r.get(fn, "—"),
+                                                  field_name)
+                            else:
+                                st.caption("No data for this field.")
 
+                    if len(selected_specs) > 1:
+                        st.divider()
+            
+            # Per-dataset score breakdown (only meaningful when >1 dataset loaded).
+            if len(selected_specs) > 1:
+                with st.expander("Per-dataset score breakdown", expanded=False):
+                    ds_cols = st.columns(len(selected_specs))
+                    for col, ds_s in zip(ds_cols, selected_specs):
+                        n_nat = len(per_ds_nat.get(ds_s.key, []))
+                        n_syn = len(per_ds_syn.get(ds_s.key, []))
+                        with col:
+                            st.markdown(f"**{ds_s.display_name}**")
+                            st.metric("Bonafide",  n_nat)
+                            st.metric("Synthetic", n_syn)
+                            if n_nat >= 2 and n_syn >= 2:
+                                try:
+                                    sc_ds = np.array(
+                                        per_ds_nat[ds_s.key] + per_ds_syn[ds_s.key],
+                                        dtype=np.float64,
+                                    )
+                                    lb_ds = np.array(
+                                        [0] * n_nat + [1] * n_syn,
+                                        dtype=np.int32,
+                                    )
+                                    eer_ds, _, _, _ = compute_eer(sc_ds, lb_ds)
+                                    st.metric("EER", f"{eer_ds * 100:.1f}%")
+                                except Exception:
+                                    st.caption("EER unavailable.")
+                            else:
+                                st.caption("Insufficient data for EER.")
+
+                    # KDE overlay per dataset.
+                    all_ds_scores = [
+                        v
+                        for ds_s in selected_specs
+                        for v in per_ds_nat.get(ds_s.key, []) + per_ds_syn.get(ds_s.key, [])
+                    ]
+                    if len(all_ds_scores) >= 4:
+                        fig_ds, ax_ds = plt.subplots(figsize=(10, 3.0))
+                        xs_ds = np.linspace(min(all_ds_scores) - 1, max(all_ds_scores) + 1, 500)
+                        ds_palette = ["#4c72b0", "#dd8452", "#55a868", "#c44e52"]
+                        for i, ds_s in enumerate(selected_specs):
+                            color = ds_palette[i % len(ds_palette)]
+                            for scores, lbl, ls in [
+                                (per_ds_nat.get(ds_s.key, []), "bonafide",  "-"),
+                                (per_ds_syn.get(ds_s.key, []), "synthetic", "--"),
+                            ]:
+                                if len(scores) < 2:
+                                    continue
+                                try:
+                                    kde_ds = gaussian_kde(
+                                        np.array(scores, dtype=np.float64),
+                                        bw_method="scott",
+                                    )
+                                    ys_ds = kde_ds(xs_ds)
+                                    ax_ds.plot(
+                                        xs_ds, ys_ds,
+                                        color=color, linewidth=1.4, linestyle=ls,
+                                        label=f"{ds_s.display_name} — {lbl} (n={len(scores)})",
+                                        alpha=0.85,
+                                    )
+                                    ax_ds.fill_between(xs_ds, ys_ds, alpha=0.07, color=color)
+                                except Exception:
+                                    pass
+                        ax_ds.set_title(f"Per-dataset KDE — {spec.display_name}", fontsize=9)
+                        ax_ds.set_xlabel("CM score", fontsize=8)
+                        ax_ds.set_ylabel("Density", fontsize=8)
+                        ax_ds.tick_params(labelsize=7)
+                        ax_ds.legend(fontsize=7, ncol=2)
+                        for sp in ax_ds.spines.values():
+                            sp.set_edgecolor("#333")
+                        fig_ds.tight_layout()
+                        st.pyplot(fig_ds, width="stretch")
+                        plt.close(fig_ds)
 
 # ---------------------------------------------------------------------------
 # Stage 1 — Inspection
@@ -1130,11 +1323,7 @@ def render_inspection() -> None:
             st.success("Auditory annotation saved.")
 
     with tab_acoust:
-        render_acoustic_tab(
-            target_audio=audio,
-            target_sr=sr,
-            target_name=name,
-        )
+        pass
 
     with tab_det:
         if st.button("Run detection on target", type="primary"):
@@ -1261,14 +1450,14 @@ def render_analysis() -> None:
 
     ds           = get_dataset(st.session_state.selected_dataset)
     selected_key = st.session_state.selected_dataset
+    selected_keys_an  = st.session_state.get("selected_datasets", [selected_key])
+    selected_specs_an = [get_dataset(k) for k in selected_keys_an]
     pipe_hash    = pipeline_cache_key(mbm_pipeline)
 
     st.markdown("**M-BM pipeline:** " + pipeline_badge(mbm_pipeline), unsafe_allow_html=True)
     if not insp_det:
         st.info("Run detection in Stage 1 first to enable target overlay on distributions.")
 
-    # ── Soundscape path setup (only shown when Soundscape Mix is in the pipeline
-    #    and the path is still a placeholder) ─────────────────────────────────
     _uses_soundscape = any(s.name == "Soundscape Mix" for s in mbm_pipeline)
     if _uses_soundscape:
         import config as _cfg
@@ -1298,7 +1487,6 @@ def render_analysis() -> None:
                     st.success("Soundscape path applied.")
                     st.rerun()
             st.stop()
-    # ─────────────────────────────────────────────────────────────────────────
 
     # Pipeline preview
     with st.expander("🔊 Pipeline preview — listen before scoring", expanded=True):
@@ -1310,79 +1498,156 @@ def render_analysis() -> None:
 
         if not mbm_pipeline:
             st.info("Add manipulation steps in the sidebar to enable preview.")
-        elif not ds.exists():
-            st.error("Dataset audio path not found. Check paths in `config.py`.")
         else:
-            wav_index    = get_wav_index(ds, selected_key)
-            preview_uids = {}
-            rng_prev     = random.Random(42)
-            for label in LABEL_CLASSES:
-                candidates = [uid for uid, utt in utterances.items() if utt.effective_label == label and uid in wav_index]
-                if candidates:
-                    preview_uids[label] = rng_prev.choice(candidates)
+            merged_wav_index: dict = {}
+            uid_to_preview_ds: dict = {}
+            unavailable_ds = []
+            for ds_an in selected_specs_an:
+                if not ds_an.exists():
+                    unavailable_ds.append(ds_an.display_name)
+                    continue
+                ds_wav = get_wav_index(ds_an, ds_an.key)
+                for uid, path in ds_wav.items():
+                    merged_wav_index[uid] = path
+                    uid_to_preview_ds[uid] = ds_an
 
-            if not preview_uids:
-                st.warning("No database audio files found on disk. Check paths in `config.py`.")
+            if unavailable_ds:
+                st.warning(
+                    f"Audio path not found for: {', '.join(unavailable_ds)}. "
+                    "Those files are excluded from preview."
+                )
+            if not merged_wav_index:
+                st.error("No audio files found on disk for any selected dataset.")
             else:
-                st.markdown("**Select preview files** (one per class):")
-                selected_preview = {}
-                for col, (label, default_uid) in zip(st.columns(len(preview_uids)), preview_uids.items()):
-                    pool = [
+                preview_uids = {}
+                rng_prev     = random.Random(42)
+                for label in LABEL_CLASSES:
+                    candidates = [
                         uid for uid, utt in utterances.items()
-                        if utt.effective_label == label and uid in wav_index
-                    ][:50]
-                    selected_preview[label] = col.selectbox(
-                        label.capitalize(), options=pool,
-                        index=pool.index(default_uid) if default_uid in pool else 0,
-                        key=f"an_prev_{label}",
-                    )
+                        if utt.effective_label == label and uid in merged_wav_index
+                    ]
+                    if candidates:
+                        preview_uids[label] = rng_prev.choice(candidates)
 
-                if st.button("Apply pipeline to preview files", key="an_prev_run"):
-                    st.session_state["an_preview_results"] = {}
-                    for label, uid in selected_preview.items():
-                        try:
-                            raw_audio, raw_sr = sf.read(str(wav_index[uid]), dtype="float32", always_2d=False)
-                            if raw_audio.ndim > 1:
-                                raw_audio = raw_audio.mean(axis=1)
-                            manip_audio = apply_pipeline(raw_audio, raw_sr, mbm_pipeline, utterance=utterances.get(uid))
-                            st.session_state["an_preview_results"][label] = {
-                                "uid": uid, "original": (raw_audio, raw_sr), "processed": (manip_audio, raw_sr),
-                            }
-                        except Exception as exc:
-                            st.session_state["an_preview_results"][label] = {"uid": uid, "error": str(exc)}
+                if not preview_uids:
+                    st.warning("No audio files found on disk. Check paths in Stage 0.")
+                else:
+                    st.markdown("**Select preview files** (one per class):")
+                    selected_preview = {}
+                    rng_pool = random.Random(99) 
+                    
+                    for col, (label, default_uid) in zip(st.columns(len(preview_uids)), preview_uids.items()):
+                        per_ds_candidates: dict = {}
+                        for ds_an in selected_specs_an:
+                            ds_uids = [
+                                uid for uid in st.session_state.get(f"utterances_{ds_an.key}", {})
+                                if uid in merged_wav_index
+                                and utterances.get(uid) is not None
+                                and utterances[uid].effective_label == label
+                            ]
+                            if ds_uids:
+                                per_ds_candidates[ds_an.key] = ds_uids
 
-                preview_results = st.session_state.get("an_preview_results", {})
-                if preview_results:
-                    st.divider()
-                    for label, result in preview_results.items():
-                        color = LABEL_COLORS.get(label, "#888")
-                        st.markdown(
-                            f'<span style="background:{color};color:#fff;border-radius:3px;'
-                            f'padding:2px 8px;font-size:0.85em;">{label}</span> '
-                            f'<span style="font-size:0.8em;color:#aaa;">{result["uid"]}</span>',
-                            unsafe_allow_html=True,
-                        )
-                        if "error" in result:
-                            st.error(f"Pipeline error: {result['error']}")
+                        pool: list = []
+                        if per_ds_candidates:
+                            ds_keys_cycle = list(per_ds_candidates.keys())
+                            shuffled = {k: sorted(v) for k, v in per_ds_candidates.items()}
+                            for v in shuffled.values():
+                                rng_pool.shuffle(v)
+                            i = 0
+                            while len(pool) < 20:
+                                ds_k = ds_keys_cycle[i % len(ds_keys_cycle)]
+                                remaining = shuffled[ds_k]
+                                if remaining:
+                                    pool.append(remaining.pop(0))
+                                i += 1
+                                if all(len(v) == 0 for v in shuffled.values()):
+                                    break
+
+                        if not pool:
+                            col.caption(f"No {label} files on disk.")
                             continue
-                        orig_audio, orig_sr = result["original"]
-                        proc_audio, proc_sr = result["processed"]
-                        col_orig, col_proc  = st.columns(2)
-                        with col_orig:
-                            waveform_player(orig_audio, orig_sr, label="Original")
-                        with col_proc:
-                            waveform_player(proc_audio, proc_sr, label="Processed")
-                        dl1, dl2 = st.columns(2)
-                        dl1.download_button(
-                            "⬇ Download original", data=audio_to_bytes(orig_audio, orig_sr),
-                            file_name=f"{result['uid']}_original.wav", mime="audio/wav",
-                            key=f"an_dl_orig_{label}",
+
+                        if default_uid not in pool:
+                            pool.insert(0, default_uid)
+
+                        def fmt_option(uid):
+                            src = uid_to_preview_ds.get(uid)
+                            return f"{uid}  ({src.display_name})" if src else uid
+
+                        default_idx = pool.index(default_uid)
+                        selected_uid = col.selectbox(
+                            label.capitalize(),
+                            options=pool,
+                            index=default_idx,
+                            format_func=fmt_option,
+                            key=f"an_prev_{label}",
                         )
-                        dl2.download_button(
-                            "⬇ Download processed", data=audio_to_bytes(proc_audio, proc_sr),
-                            file_name=f"{result['uid']}_{pipe_hash}.wav", mime="audio/wav",
-                            key=f"an_dl_proc_{label}",
-                        )
+                        selected_preview[label] = selected_uid
+                        
+                    if st.button("Apply pipeline to preview files", key="an_prev_run"):
+                        st.session_state["an_preview_results"] = {}
+                        for label, uid in selected_preview.items():
+                            audio_path = merged_wav_index.get(uid)
+                            if audio_path is None:
+                                st.session_state["an_preview_results"][label] = {
+                                    "uid": uid, "error": "File not found in any dataset index."
+                                }
+                                continue
+                            try:
+                                try:
+                                    import io as _io
+                                    with open(str(audio_path), "rb") as _fh:
+                                        _buf = _io.BytesIO(_fh.read())
+                                    raw_audio, raw_sr = sf.read(_buf, dtype="float32", always_2d=False)
+                                    if raw_audio.ndim > 1:
+                                        raw_audio = raw_audio.mean(axis=1)
+                                except Exception as _sf_exc:
+                                    raise RuntimeError(
+                                        f"Could not decode {audio_path.name}: {_sf_exc}. "
+                                        f"The file may be corrupted or truncated."
+                                    ) from _sf_exc
+                                manip_audio = apply_pipeline(raw_audio, raw_sr, mbm_pipeline, utterance=utterances.get(uid))
+                                st.session_state["an_preview_results"][label] = {
+                                    "uid": uid, "original": (raw_audio, raw_sr), "processed": (manip_audio, raw_sr),
+                                }
+                            except Exception as exc:
+                                st.session_state["an_preview_results"][label] = {"uid": uid, "error": str(exc)}
+
+                    preview_results = st.session_state.get("an_preview_results", {})
+                    if preview_results:
+                        st.divider()
+                        for label, result in preview_results.items():
+                            color    = LABEL_COLORS.get(label, "#888")
+                            src_ds   = uid_to_preview_ds.get(result["uid"])
+                            src_name = f" · {src_ds.display_name}" if src_ds else ""
+                            st.markdown(
+                                f'<span style="background:{color};color:#fff;border-radius:3px;'
+                                f'padding:2px 8px;font-size:0.85em;">{label}</span> '
+                                f'<span style="font-size:0.8em;color:#aaa;">{result["uid"]}{src_name}</span>',
+                                unsafe_allow_html=True,
+                            )
+                            if "error" in result:
+                                st.error(f"Pipeline error: {result['error']}")
+                                continue
+                            orig_audio, orig_sr = result["original"]
+                            proc_audio, proc_sr = result["processed"]
+                            col_orig, col_proc  = st.columns(2)
+                            with col_orig:
+                                waveform_player(orig_audio, orig_sr, label="Original")
+                            with col_proc:
+                                waveform_player(proc_audio, proc_sr, label="Processed")
+                            dl1, dl2 = st.columns(2)
+                            dl1.download_button(
+                                "⬇ Download original", data=audio_to_bytes(orig_audio, orig_sr),
+                                file_name=f"{result['uid']}_original.wav", mime="audio/wav",
+                                key=f"an_dl_orig_{label}",
+                            )
+                            dl2.download_button(
+                                "⬇ Download processed", data=audio_to_bytes(proc_audio, proc_sr),
+                                file_name=f"{result['uid']}_processed.wav", mime="audio/wav",
+                                key=f"an_dl_proc_{label}",
+                            )
                     st.divider()
 
     # Mini scoring
@@ -1608,23 +1873,47 @@ def render_analysis() -> None:
         f"{'preset pipeline' if current_preset_key else 'custom pipeline (hash)'}."
     )
 
-    mbm_cached    = {}
+    mbm_cached     = {}
     mbm_cache_rows = []
+    missing_models = []
 
-    for spec in MODEL_SPECS:
-        if spec.key not in an_models:
-            continue
-        cache_path = mbm_cache_path(selected_key, spec.key, active_cache_key)
-        scores     = load_mbm_cache_file(cache_path)
-        if scores:
-            scored_at = json.loads(cache_path.read_text()).get("scored_at", "unknown")
-            mbm_cached[spec.key] = scores
-            mbm_cache_rows.append({"Model": spec.display_name, "Status": "✅", "Files": len(scores), "Scored at": scored_at, "_key": spec.key, "_complete": True})
-        else:
-            mbm_cache_rows.append({"Model": spec.display_name, "Status": "❌", "Files": "—", "Scored at": "—", "_key": spec.key, "_complete": False})
+    for ds_an in selected_specs_an:
+        for spec in MODEL_SPECS:
+            if spec.key not in an_models:
+                continue
+            cache_path = mbm_cache_path(ds_an.key, spec.key, active_cache_key)
+            scores     = load_mbm_cache_file(cache_path)
+            is_complete = bool(scores)
+            if is_complete:
+                scored_at = json.loads(cache_path.read_text()).get("scored_at", "unknown")
+                mbm_cached[spec.key] = scores
+                mbm_cache_rows.append({
+                    "Dataset": ds_an.display_name,
+                    "Model":     spec.display_name,
+                    "Status":    "✅",
+                    "Files":     len(scores),
+                    "Scored at": scored_at,
+                    "_ds_key":   ds_an.key,
+                    "_key":      spec.key,
+                    "_complete": True,
+                })
+            else:
+                mbm_cache_rows.append({
+                    "Dataset": ds_an.display_name,
+                    "Model":     spec.display_name,
+                    "Status":    "❌",
+                    "Files":     None,
+                    "Scored at": "—",
+                    "_ds_key":   ds_an.key,
+                    "_key":      spec.key,
+                    "_complete": False,
+                })
+                missing_models.append((ds_an.key, spec.key))
 
-    st.dataframe(pd.DataFrame(mbm_cache_rows).drop(columns=["_key", "_complete"]), use_container_width=True, hide_index=True)
-    missing_models = [r["_key"] for r in mbm_cache_rows if not r["_complete"]]
+    st.dataframe(
+        pd.DataFrame(mbm_cache_rows).drop(columns=["_ds_key", "_key", "_complete"]),
+        use_container_width=True, hide_index=True,
+    )
 
     col_single, col_all, col_clr = st.columns([2, 2, 1])
 
@@ -1635,13 +1924,14 @@ def render_analysis() -> None:
     )
 
     presets_missing = [
-        (pkey, spec.key)
+        (pkey, ds_an.key, spec.key)
         for pkey in PRESET_PIPELINES
+        for ds_an in selected_specs_an
         for spec in MODEL_SPECS
-        if spec.key in an_models and not load_mbm_cache_file(mbm_cache_path(selected_key, spec.key, pkey))
+        if spec.key in an_models
+        and not load_mbm_cache_file(mbm_cache_path(ds_an.key, spec.key, pkey))
     ]
-    # deduplicate by preset key (one missing model is enough to flag a preset)
-    flagged_presets = list(dict.fromkeys(pkey for pkey, _ in presets_missing))
+    flagged_presets = list(dict.fromkeys(pkey for pkey, _, _ in presets_missing))
 
     run_all_presets = col_all.button(
         f"Score all presets  ({len(flagged_presets)} incomplete)",
@@ -1649,46 +1939,59 @@ def render_analysis() -> None:
     )
 
     if col_clr.button("Clear cache", key="mbm_clr"):
-        for spec in MODEL_SPECS:
-            for path in [mbm_cache_path(selected_key, spec.key, active_cache_key),
-                         mbm_partial_path(selected_key, spec.key, active_cache_key)]:
-                if path.exists():
-                    path.unlink()
+        for ds_an in selected_specs_an:
+            for spec in MODEL_SPECS:
+                for path in [mbm_cache_path(ds_an.key, spec.key, active_cache_key),
+                             mbm_partial_path(ds_an.key, spec.key, active_cache_key)]:
+                    if path.exists():
+                        path.unlink()
         st.session_state.an_lr_results = {}
         st.rerun()
 
     if run_active and missing_models:
         if not mbm_pipeline:
             st.warning("No pipeline steps defined.")
-        elif not ds.exists():
-            st.error("Dataset path not found.")
         else:
-            run_mbm_scoring(mbm_pipeline, active_cache_key, missing_models, selected_key, ds, utterances, an_models)
+            for ds_key_missing, model_key_missing in missing_models:
+                ds_missing = get_dataset(ds_key_missing)
+                if not ds_missing.exists():
+                    st.error(f"Dataset path not found: {ds_missing.display_name}")
+                    continue
+                utts_missing = st.session_state.get(f"utterances_{ds_key_missing}", {})
+                run_mbm_scoring(
+                    mbm_pipeline, active_cache_key,
+                    [model_key_missing], ds_key_missing,
+                    ds_missing, utts_missing, an_models,
+                )
             st.rerun()
 
     if run_all_presets:
-        if not ds.exists():
-            st.error("Dataset path not found.")
-        else:
-            for pkey, pinfo in PRESET_PIPELINES.items():
+        for pkey, pinfo in PRESET_PIPELINES.items():
+            for ds_an in selected_specs_an:
                 models_needed = [
                     spec.key for spec in MODEL_SPECS
-                    if spec.key in an_models and not load_mbm_cache_file(mbm_cache_path(selected_key, spec.key, pkey))
+                    if spec.key in an_models
+                    and not load_mbm_cache_file(mbm_cache_path(ds_an.key, spec.key, pkey))
                 ]
                 if not models_needed:
                     continue
-                st.markdown(f"**{pkey}** — {pinfo['display']}")
-                run_mbm_scoring(pinfo["steps"], pkey, models_needed, selected_key, ds, utterances, an_models)
-            st.rerun()
+                if not ds_an.exists():
+                    st.error(f"Dataset path not found: {ds_an.display_name}")
+                    continue
+                utts_an = st.session_state.get(f"utterances_{ds_an.key}", {})
+                st.markdown(f"**{pkey}** — {pinfo['display']} ({ds_an.display_name})")
+                run_mbm_scoring(pinfo["steps"], pkey, models_needed, ds_an.key, ds_an, utts_an, an_models)
+        st.rerun()
 
     # Load all cached presets for downstream analysis
     for pkey in PRESET_PIPELINES:
-        for spec in MODEL_SPECS:
-            if spec.key not in an_models:
-                continue
-            scores = load_mbm_cache_file(mbm_cache_path(selected_key, spec.key, pkey))
-            if scores:
-                mbm_cached[(pkey, spec.key)] = scores
+        for ds_an in selected_specs_an:
+            for spec in MODEL_SPECS:
+                if spec.key not in an_models:
+                    continue
+                scores = load_mbm_cache_file(mbm_cache_path(ds_an.key, spec.key, pkey))
+                if scores:
+                    mbm_cached[(pkey, spec.key)] = scores
 
     if not mbm_cached:
         st.info("No M-BM scores cached yet. Select a preset or build a custom pipeline, then click Score.")
@@ -1758,7 +2061,7 @@ def render_analysis() -> None:
                          f"target\n{target_cm:.2f}", color="#000000", fontsize=7, va="top")
 
             ax2.set_title("BM vs M-BM overlay", fontsize=9)
-            ax2.set_xlabel("CM score  [log-odds of synthetic]", fontsize=8)
+            ax2.set_xlabel("CM score", fontsize=8)
             ax2.set_ylabel("Density", fontsize=8)
             ax2.tick_params(labelsize=7)
             ax2.legend(fontsize=7, ncol=2)
@@ -1852,7 +2155,7 @@ def render_analysis() -> None:
                 ax.axvline(target_cm, color="#000000", linewidth=2.0, linestyle="-", label=f"Target CM = {target_cm:.2f}", zorder=6)
                 ax.set_yticks([0, 1])
                 ax.set_yticklabels(["Synthetic", "Bonafide"], fontsize=8)
-                ax.set_xlabel("CM score  [log-odds of synthetic]", fontsize=8)
+                ax.set_xlabel("CM score", fontsize=8)
                 ax.set_title(title, fontsize=9)
                 ax.tick_params(labelsize=7)
                 ax.legend(fontsize=7, loc="upper left")

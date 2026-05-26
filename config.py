@@ -21,6 +21,14 @@ LLAMAPARTIALSPOOF_LABEL_FILE: str = r"path/to/LlamaPartialSpoof/label_file.txt"
 SOUNDSCAPE_DIR: str = r"path/to/ISD/WAV_London_1/Audio"
 
 # ---------------------------------------------------------------------------
+# ASVspoof 2021 Logical Access dataset
+# Audio:  https://zenodo.org/records/4837263  (ASVspoof2021_LA_eval/)
+# Keys:   https://www.asvspoof.org/asvspoof2021/LA-keys-full.tar.gz
+# ---------------------------------------------------------------------------
+ASVSPOOF2021_LA_AUDIO_DIR:  str = r"path/to/ASVspoof2021_LA_eval/flac"
+ASVSPOOF2021_LA_LABEL_FILE: str = r"path/to/LA-keys-full/LA/CM/trial_metadata.txt"
+
+# ---------------------------------------------------------------------------
 # Path helpers — dataset-agnostic
 # ---------------------------------------------------------------------------
 _PLACEHOLDER_PREFIX = "path/to"

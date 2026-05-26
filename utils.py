@@ -1,41 +1,24 @@
-"""
-Shared utility functions for the Voice Deepfake Forensic Pipeline.
+"""Shared utility functions for the Voice Deepfake Forensic Pipeline.
 
 Provides:
-  - Core data types: Segment, Utterance
-  - Label file parsing: parse_label_file
-  - UID utilities: generation_model
-  - Binning helpers: duration_bin, n_synth_segs_bin
-  - Display helpers: label_badge
-  - Audio I/O: audio_to_bytes, load_wav_bytes
-
-Constants:
-    DURATION_SHORT_THRESHOLD  : Upper bound (exclusive) for 'short' duration bin (s).
-    DURATION_LONG_THRESHOLD   : Lower bound (inclusive) for 'long' duration bin (s).
-    SYNTH_SEG_MEDIAN_THRESHOLD: Upper bound (inclusive) for '1-3' synthetic segments bin.
+  - Core data types : Segment, Utterance
+  - Audio I/O       : audio_to_bytes, load_wav_bytes
+  - UI helpers      : waveform_player, label_badge
 """
 
-import io, logging, re
+import base64
+import io
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
+
 import numpy as np
 import soundfile as sf
 from scipy.io import wavfile
-import base64
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-DURATION_SHORT_THRESHOLD   = 3.0   # seconds
-DURATION_LONG_THRESHOLD    = 8.0   # seconds
-SYNTH_SEG_MEDIAN_THRESHOLD = 3     # segments
-
-# Valid utterance-level labels in the LlamaPartialSpoof format.
-_UTT_LABELS = frozenset({"bonafide", "synthetic", "spoof"})
-_SEGMENT_RE = re.compile(r"^(\d+\.?\d*)-(\d+\.?\d*)-(\w+)$")
 
 # ---------------------------------------------------------------------------
 # Core data types
@@ -50,12 +33,26 @@ class Segment:
 
 @dataclass
 class Utterance:
-    """A parsed audio utterance with metadata and optional segment-level detail."""
+    """A parsed audio utterance with metadata and optional segment-level detail.
 
-    uid:      str
-    duration: float
-    label:    str
-    segments: List[Segment] = field(default_factory=list)
+    Fields
+    ------
+    uid:       Unique utterance identifier.
+    duration:  Duration in seconds. May be 0.0 when the audio file was not
+               available at parse time (e.g. subset downloads).
+    label:     Ground-truth utterance label ('bonafide', 'spoof', 'synthetic').
+    segments:  Optional list of time-bounded segment labels.
+    attack_id: Spoofing system identifier (e.g. ASVspoof A07-A19).
+               None for datasets that do not carry this field.
+    codec:     Transmission codec condition (e.g. ASVspoof 'alaw', 'none').
+               None for datasets that do not carry this field.
+    """
+    uid:       str
+    duration:  float
+    label:     str
+    segments:  List[Segment] = field(default_factory=list)
+    attack_id: Optional[str] = None
+    codec:     Optional[str] = None
 
     @property
     def is_partial(self) -> bool:
@@ -79,223 +76,6 @@ class Utterance:
             return "partial synthetic" if self.is_partial else "synthetic"
         return "synthetic"
 
-    @property
-    def tts_model(self) -> Optional[str]:
-        """TTS model identifier extracted from the UID, or None for bonafide."""
-        model = generation_model(self.uid)
-        return None if model == "bonafide" else model
-
-
-# ---------------------------------------------------------------------------
-# Label file parsing
-# ---------------------------------------------------------------------------
-def _is_valid_uid(tok: str) -> bool:
-    """Return True if *tok* looks like a LlamaPartialSpoof UID."""
-    return (
-        bool(tok)
-        and tok[0].isalpha()
-        and "_" in tok
-        and not _SEGMENT_RE.match(tok)
-    )
-
-
-def _parse_segment(tok: str) -> Segment:
-    """Parse a segment token '<start>-<end>-<label>' into a Segment.
-
-    Raises
-    ------
-    ValueError
-        If the token does not match the expected format.
-    """
-    m = _SEGMENT_RE.match(tok)
-    if not m:
-        raise ValueError(f"Invalid segment token: {tok!r}")
-    return Segment(float(m.group(1)), float(m.group(2)), m.group(3))
-
-
-def parse_label_file(path: Union[str, Path]) -> Dict[str, Utterance]:
-    """Parse a LlamaPartialSpoof label file into a dict of Utterances.
-
-    Expected format — one record per line::
-
-        <uid> <duration_s> <utterance_label> [<start>-<end>-<label> ...]
-
-    Examples::
-
-        test-clean_123 5.0 bonafide
-        dev01-cosyvoice_456 3.2 spoof 0.0-1.5-spoof 2.0-3.2-bonafide
-
-    Parameters
-    ----------
-    path:
-        Path to the label file.
-
-    Returns
-    -------
-    Dict[str, Utterance]
-        Mapping of UID -> Utterance. Duplicate UIDs keep the last occurrence.
-
-    Raises
-    ------
-    FileNotFoundError
-        If the file does not exist.
-    """
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(f"Label file not found: {path}")
-
-    utterances: Dict[str, Utterance] = {}
-
-    with open(path, "r", encoding="utf-8") as f:
-        for line_num, raw_line in enumerate(f, start=1):
-            line = raw_line.strip()
-            if not line:
-                continue
-
-            tokens = line.split()
-            uid, duration_str, utt_label = tokens[0], tokens[1], tokens[2]
-
-            if not _is_valid_uid(uid):
-                logger.debug("Line %d: invalid UID %r, skipping.", line_num, uid)
-                continue
-
-            try:
-                duration = float(duration_str)
-            except ValueError:
-                logger.debug("Line %d: non-numeric duration %r, skipping.", line_num, duration_str)
-                continue
-
-            if utt_label not in _UTT_LABELS:
-                logger.debug("Line %d: unknown label %r, skipping.", line_num, utt_label)
-                continue
-
-            segments: List[Segment] = []
-            for tok in tokens[3:]:
-                if _SEGMENT_RE.match(tok):
-                    try:
-                        segments.append(_parse_segment(tok))
-                    except ValueError as exc:
-                        logger.warning("Line %d: skipping invalid segment %r — %s", line_num, tok, exc)
-
-            utterances[uid] = Utterance(uid=uid, duration=duration, label=utt_label, segments=segments)
-
-    return utterances
-
-
-# ---------------------------------------------------------------------------
-# UID utilities
-# ---------------------------------------------------------------------------
-def generation_model(uid: str) -> str:
-    """Extract the TTS generation model identifier from a UID.
-
-    Follows the LlamaPartialSpoof naming convention::
-
-        <partition>-<model>_<speaker>_...
-
-    Returns 'bonafide' when the UID represents genuine speech (i.e. the
-    partition suffix is 'clean' or absent).
-
-    Parameters
-    ----------
-    uid:
-        Utterance identifier string.
-
-    Raises
-    ------
-    TypeError
-        If *uid* is not a string.
-    ValueError
-        If *uid* is blank.
-    """
-    if not isinstance(uid, str):
-        raise TypeError(f"uid must be a string, got {type(uid).__name__!r}")
-    if not uid.strip():
-        raise ValueError("uid must not be empty or blank.")
-
-    prefix = uid.split("_")[0]         
-    parts  = prefix.split("-", 1)      
-    if len(parts) < 2 or parts[1] == "clean":
-        return "bonafide"
-    return parts[1]
-
-
-# ---------------------------------------------------------------------------
-# Binning helpers
-# ---------------------------------------------------------------------------
-def duration_bin(duration_s: Union[int, float]) -> str:
-    """Bin an audio duration into one of three named categories.
-
-    Thresholds are derived from LlamaPartialSpoof duration statistics:
-        - short: < 3s
-        - medium: 3s - 8s
-        - long: >8s
-
-    Parameters
-    ----------
-    duration_s:
-        Audio duration in seconds. Must be a non-negative int or float.
-
-    Returns
-    -------
-    str
-        One of 'short', 'medium', or 'long'.
-
-    Raises
-    ------
-    TypeError
-        If *duration_s* is not an int or float (booleans are rejected).
-    ValueError
-        If *duration_s* is negative.
-    """
-    if isinstance(duration_s, bool) or not isinstance(duration_s, (int, float)):
-        raise TypeError(f"duration_s must be int or float, got {type(duration_s).__name__!r}")
-    if duration_s < 0:
-        raise ValueError(f"duration_s must be non-negative, got {duration_s}")
-
-    if duration_s < DURATION_SHORT_THRESHOLD:
-        return "short"
-    if duration_s < DURATION_LONG_THRESHOLD:
-        return "medium"
-    return "long"
-
-
-def n_synth_segs_bin(n: int) -> str:
-    """Bin a synthetic segment count into one of three named categories.
-
-    Thresholds are derived from LlamaPartialSpoof segment statistics
-    (median = 3, p75 = 5, p90 = 7, max = 20):
-     - 0: Bonafide or fully synthetic (no splicing)
-     - 1-3: Below-or-at-median partial synthetic
-     - 3+: Above-median partial synthetic
-
-    Parameters
-    ----------
-    n:
-        Number of synthetic segments. Must be a non-negative int.
-
-    Returns
-    -------
-    str
-        One of '0', '1-3', or '3+'.
-
-    Raises
-    ------
-    TypeError
-        If *n* is not an int (booleans are rejected).
-    ValueError
-        If *n* is negative.
-    """
-    if isinstance(n, bool) or not isinstance(n, int):
-        raise TypeError(f"n must be an int, got {type(n).__name__!r}")
-    if n < 0:
-        raise ValueError(f"n must be non-negative, got {n}")
-
-    if n == 0:
-        return "0"
-    if n <= SYNTH_SEG_MEDIAN_THRESHOLD:
-        return "1-3"
-    return "3+"
-
 
 # ---------------------------------------------------------------------------
 # Display helpers
@@ -315,8 +95,8 @@ def label_badge(effective_label: str) -> str:
         e.g. '[bonafide]', '[synthetic]', '[partial synthetic]'.
     """
     _DISPLAY = {
-        "bonafide":         "bonafide",
-        "synthetic":        "synthetic",
+        "bonafide":          "bonafide",
+        "synthetic":         "synthetic",
         "partial synthetic": "partial synthetic",
     }
     return f"[{_DISPLAY.get(effective_label, effective_label)}]"
@@ -350,12 +130,12 @@ def audio_to_bytes(audio: np.ndarray, sr: int) -> bytes:
 
 
 def load_wav_bytes(data: bytes) -> Tuple[np.ndarray, int]:
-    """Decode WAV bytes into a mono float32 array.
+    """Decode WAV/FLAC/MP3 bytes into a mono float32 array.
 
     Parameters
     ----------
     data:
-        Raw WAV file bytes.
+        Raw audio file bytes (any format supported by soundfile).
 
     Returns
     -------
