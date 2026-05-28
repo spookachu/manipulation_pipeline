@@ -28,9 +28,7 @@ matplotlib.use("Agg")
 
 from background_model import (
     compute_likelihood_ratio,
-    compute_posterior,
-    compute_decision_threshold,
-    evaluate_hypothesis_shift,
+    verbal_lr_strength
 )
 from config import (
     apply_path_overrides,
@@ -170,9 +168,6 @@ def build_plot_and_lr_dicts(agg_data: dict) -> tuple:
 
 def compute_lr_scores(nat_cm: list, syn_cm: list) -> tuple:
     """Compute per-utterance LR values from CM scores using KDE-fitted densities.
-
-    Returns (lr_values, labels) ready for compute_cllr, or (None, None)
-    if either distribution has insufficient samples.
     """
     from background_model import _fit_kde, _log_pdf_kde
     kde_bonaf = _fit_kde(nat_cm)
@@ -1020,6 +1015,7 @@ def render_database() -> None:
 
             n_cols     = len(plot_dict) + (1 if eer_info else 0) + (1 if cllr_val is not None else 0)
             count_cols = st.columns(n_cols)
+ 
             for i, (lbl, scores) in enumerate(plot_dict.items()):
                 count_cols[i].metric(lbl, len(scores))
             col_idx = len(plot_dict)
@@ -1239,10 +1235,7 @@ def render_inspection() -> None:
     tab_acoust, tab_aud, tab_det = st.tabs(["Acoustic Analysis", "Auditory Analysis", "Synthetic Content Analysis"])
 
     with tab_aud:
-        st.caption(
-            "Record auditory observations heard during listening. These annotations "
-            "form part of the expert evidence record and inform the manipulation hypothesis."
-        )
+        st.caption("Record auditory observations heard during listening.")
         aud = st.session_state.insp_auditory
 
         def aud_section(title, key, options, multiselect=True):
@@ -1314,8 +1307,7 @@ def render_inspection() -> None:
         aud["notes"] = st.text_area(
             "Additional observations", value=aud.get("notes", ""), height=100,
             placeholder=(
-                "Record any observations not captured above: unusual phonetic features, "
-                "suspected splices, inconsistencies between segments, etc."
+                "Record any observations not captured above."
             ),
             key="aud_notes", label_visibility="collapsed",
         )
@@ -1386,19 +1378,6 @@ def render_analysis() -> None:
         with st.expander("Custom pipeline builder", expanded=False):
             pipeline_sidebar("an", "an_mbm_pipeline", title="")
 
-        st.markdown("### Forensic Parameters")
-        st.session_state.prior_prob = st.slider(
-            "Prior P(Hp)", 0.001, 0.999, st.session_state.prior_prob, 0.001,
-            help="Prior probability that the target is synthetic.",
-        )
-        st.session_state.cost_fp = st.number_input(
-            "Cost FP", 0.1, 100.0, st.session_state.cost_fp, 0.1,
-            help="Cost of declaring genuine audio synthetic.",
-        )
-        st.session_state.cost_fn = st.number_input(
-            "Cost FN", 0.1, 100.0, st.session_state.cost_fn, 0.1,
-            help="Cost of declaring synthetic audio genuine.",
-        )
 
     st.title("Stage 2 - Analysis")
 
@@ -1412,9 +1391,6 @@ def render_analysis() -> None:
     an_models    = st.session_state.get("insp_models", [s.key for s in MODEL_SPECS])
     mbm_pipeline = st.session_state.an_mbm_pipeline
     utterances   = st.session_state.utterances
-    prior        = st.session_state.prior_prob
-    cost_fp      = st.session_state.cost_fp
-    cost_fn      = st.session_state.cost_fn
 
     if not st.session_state.db_cm_scores:
         st.warning("No BM scores found. Go to Stage 0 -> Background Model tab to load scores.")
@@ -1487,12 +1463,7 @@ def render_analysis() -> None:
                     uid_to_preview_ds[uid] = ds_an
 
             if unavailable_ds:
-                st.warning(
-                    f"Audio path not found for: {', '.join(unavailable_ds)}. "
-                    "Those files are excluded from preview."
-                )
-            if not merged_wav_index:
-                st.error("No audio files found on disk for any selected dataset.")
+                st.warning(f"Audio path not found for: {', '.join(unavailable_ds)}. ")
             else:
                 preview_uids = {}
                 rng_prev     = random.Random(42)
@@ -2048,43 +2019,74 @@ def render_analysis() -> None:
 
         # LR assessment
         if target_cm is not None:
+            import math
             lr_result = compute_likelihood_ratio(target_cm, bm_scores, mbm_scores)
             st.session_state.an_lr_results[spec.key] = lr_result
 
-            lr_bm    = lr_result.lr_bm
-            lr_mbm   = lr_result.lr_mbm
-            post_bm  = compute_posterior(lr_bm,  prior) if lr_bm  is not None else float("nan")
-            post_mbm = compute_posterior(lr_mbm, prior) if lr_mbm is not None else float("nan")
-            tau      = compute_decision_threshold(cost_fp, cost_fn, prior)
+            mc1, mc2, mc3 = st.columns(3)
+            mc1.metric("Target CM",         round(target_cm, 4))
+            mc2.metric("LR (authenticity)", f"{lr_result.lr_authenticity:.2e}"
+                    if lr_result.lr_authenticity is not None else "N/A")
+            mc3.metric("LR (manipulation)", f"{lr_result.lr_manipulation:.2e}"
+                    if lr_result.lr_manipulation is not None else "N/A")
 
-            mc1, mc2, mc3, mc4, pc1, pc2 = st.columns(6)
-            mc1.metric("Target CM",     round(target_cm, 4))
-            mc2.metric("LR (BM)",       f"{lr_bm:.2e}"  if lr_bm  is not None and not np.isnan(lr_bm)  else "N/A")
-            mc3.metric("LR (M-BM)",     f"{lr_mbm:.2e}" if lr_mbm is not None and not np.isnan(lr_mbm) else "N/A")
-            mc4.metric("τ (reference)", f"{tau:.2e}"    if not np.isnan(tau) else "N/A")
-            pc1.metric("P(synth|BM)",   f"{post_bm:.3f}"  if not np.isnan(post_bm)  else "N/A")
-            pc2.metric("P(synth|M-BM)", f"{post_mbm:.3f}" if not np.isnan(post_mbm) else "N/A")
-
-            col_verdict, col_hypo = st.columns(2)
-            with col_verdict:
-                st.markdown("### LR Verdict")
-                if lr_mbm is not None and not np.isnan(lr_mbm):
-                    if lr_mbm > tau:
-                        st.success(f"LR ({lr_mbm:.2e}) > τ ({tau:.2e}) — evidence supports **synthetic**.")
-                    else:
-                        st.warning(f"LR ({lr_mbm:.2e}) ≤ τ ({tau:.2e}) — insufficient evidence.")
+            strength_str = verbal_lr_strength(lr_result.lr_authenticity)
+            if lr_result.lr_authenticity is not None and not math.isnan(float(lr_result.lr_authenticity or 0)):
+                if lr_result.lr_authenticity >= 1.0:
+                    st.success(f"**Evidence strength:** {strength_str}")
+                elif lr_result.lr_authenticity >= 0.1:
+                    st.info(f"**Evidence strength:** {strength_str}")
                 else:
-                    st.error("LR not computable.")
+                    st.warning(f"**Evidence strength:** {strength_str}")
+            else:
+                st.info(f"**Evidence strength:** {strength_str}")
+    
+            from background_model import evaluate_synthetic_evasion
 
-            with col_hypo:
-                st.markdown("### Hypothesis Shift")
-                shift = evaluate_hypothesis_shift(lr_bm, lr_mbm, log_lr_bm=lr_result.log_lr_bm, log_lr_mbm=lr_result.log_lr_mbm)
-                if shift == "Supported":
-                    st.success(f"**Supported** — LR increased: {lr_bm:.2e} -> {lr_mbm:.2e}")
-                elif shift == "Not Supported":
-                    st.warning("**Not Supported** — LR decreased.")
+            evasion = evaluate_synthetic_evasion(bm_scores, mbm_scores)
+            st.markdown("### Synthetic Evasion",
+                        help = "Tests whether the manipulation pipeline shifts synthetic CM scores "
+                "toward the bonafide distribution, i.e. whether the processing "
+                "makes synthetic speech harder to detect. A negative mean shift "
+                "and increased overlap indicate the pipeline is consistent with "
+                "having been applied to obfuscate synthetic content.")
+
+            if evasion.error:
+                st.warning(f"Evasion analysis unavailable: {evasion.error}")
+            else:
+                m_col1, m_col2 = st.columns(2)
+                with m_col1:
+                    m_col1.metric(
+                    "Mean CM shift (synthetic)",
+                    f"{evasion.mean_shift:+.3f}" if evasion.mean_shift is not None else "N/A",
+                    help="Mean M-BM synthetic CM - mean BM synthetic CM. "
+                        "Negative = shifted toward bonafide = harder to detect.",
+                    )
+                    #m_col1.metric(
+                    #    "Evading BM (%)",
+                    #    f"{evasion.pct_evading_bm:.1f}%" if evasion.pct_evading_bm is not None else "N/A",
+                    #    help="% of BM synthetic scores below CM = 0 (misclassified as bonafide).",
+                    #)
+                with m_col2:
+                    m_col2.metric(
+                        "Distribution overlap increase",
+                        f"{evasion.overlap_increase:+.4f}" if evasion.overlap_increase is not None else "N/A",
+                        help="Bhattacharyya coefficient increase between bonafide and "
+                            "synthetic distributions. Positive = more confused.",
+                    )
+                    #m_col2.metric(
+                    #    "Evading M-BM (%)",
+                    #    f"{evasion.pct_evading_mbm:.1f}%" if evasion.pct_evading_mbm is not None else "N/A",
+                    #    help="% of M-BM synthetic scores below CM = 0.",
+                    #)
+
+                if evasion.mean_shift is not None and evasion.mean_shift < 0:
+                    st.success(f"**{evasion.evasion_verdict}**")
+                elif "not supported" in evasion.evasion_verdict.lower():
+                    st.warning(f"**{evasion.evasion_verdict}**")
                 else:
-                    st.error(f"**Inconclusive** — {shift}")
+                    st.info(f"**{evasion.evasion_verdict}**")
+
         else:
             st.info("Run detection on target in Stage 1 to enable LR assessment.")
 
@@ -2151,7 +2153,7 @@ with st.sidebar:
     st.markdown("## Voice Deepfake Forensics")
     page = st.radio(
         "Page",
-        ["Stage 0 - Database", "Stage 1 - Inspection", "Stage 2 - Analysis"],
+        ["Stage 0 - Database", "Stage 1 - Inspection", "Stage 2 - Analysis", "Stage 3 - Report"],
         label_visibility="collapsed",
     )
     st.divider()
@@ -2159,3 +2161,6 @@ with st.sidebar:
 if   page == "Stage 0 - Database":   render_database()
 elif page == "Stage 1 - Inspection": render_inspection()
 elif page == "Stage 2 - Analysis":   render_analysis()
+elif page == "Stage 3 - Report":
+    from report import render_report_section
+    render_report_section()
