@@ -22,9 +22,20 @@ import numpy as np
 import pandas as pd
 import soundfile as sf
 import streamlit as st
-from scipy.stats import gaussian_kde
 
 matplotlib.use("Agg")
+
+from visualizations import (
+    LABEL_COLORS,
+    cat_color,
+    pipeline_badge,
+    kde_plot,
+    bm_kde_sidebyside,
+    bm_kde_overlay,
+    per_dataset_kde,
+    combo_shift_kde,
+    neighbourhood_composition,
+)
 
 from background_model import (
     compute_likelihood_ratio,
@@ -82,18 +93,6 @@ CACHE_DIR.mkdir(exist_ok=True)
 
 WINDOW_S = 0.5  # minimum audio window for detection confidence warning
 
-LABEL_COLORS = {
-    "bonafide":          "#50dc3d",
-    "synthetic":         "#f21010",
-    "partial synthetic": "#ffd166",
-}
-
-CAT_COLORS = {
-    "Manipulation Cloaking":  "#7b61ff",
-    "Signal Degradation":     "#e07b39",
-    "Environment Simulation": "#3da368",
-}
-
 MODEL_DISPLAY = {s.key: s.display_name for s in MODEL_SPECS}
 LABEL_CLASSES = ["bonafide", "synthetic", "partial synthetic"]
 
@@ -101,20 +100,6 @@ LABEL_CLASSES = ["bonafide", "synthetic", "partial synthetic"]
 # ---------------------------------------------------------------------------
 # Module-level helpers
 # ---------------------------------------------------------------------------
-def cat_color(name: str) -> str:
-    return CAT_COLORS.get(MANIPULATIONS.get(name, {}).get("category", ""), "#888")
-
-
-def pipeline_badge(steps: list) -> str:
-    if not steps:
-        return "<em>none</em>"
-    return " &rarr; ".join(
-        f'<span style="background:{cat_color(s.name)};color:#fff;border-radius:3px;'
-        f'padding:1px 5px;font-size:0.78em;">{s.name}</span>'
-        for s in steps
-    )
-
-
 def get_wav_index(ds, selected_key: str) -> dict:
     key = f"wav_index_{selected_key}"
     if key not in st.session_state:
@@ -168,6 +153,9 @@ def build_plot_and_lr_dicts(agg_data: dict) -> tuple:
 
 def compute_lr_scores(nat_cm: list, syn_cm: list) -> tuple:
     """Compute per-utterance LR values from CM scores using KDE-fitted densities.
+
+    Returns (lr_values, labels) ready for compute_cllr, or (None, None)
+    if either distribution has insufficient samples.
     """
     from background_model import _fit_kde, _log_pdf_kde
     kde_bonaf = _fit_kde(nat_cm)
@@ -466,80 +454,6 @@ def pipeline_sidebar(stage_key: str, pipeline_state_key: str, title: str = "Mani
             st.rerun()
     else:
         st.caption("No steps added.")
-
-
-def kde_plot(scores_by_label: dict, suspect_cm: float = None, title: str = "", threshold: float = None, ax=None):
-    """Plot KDE distributions for bonafide/synthetic CM scores on ax.
-
-    If ax is None a standalone figure is created and returned.
-    The EER threshold is computed automatically when threshold is None
-    and both bonafide and synthetic scores are available.
-    """
-    standalone = ax is None
-    if standalone:
-        fig, ax = plt.subplots(figsize=(6, 3.2))
-
-    all_sc = [v for lst in scores_by_label.values() for v in lst]
-    if not all_sc:
-        ax.text(0.5, 0.5, "No data", ha="center", va="center", color="#aaa", transform=ax.transAxes)
-        return fig if standalone else None
-
-    xs       = np.linspace(min(all_sc) - 1, max(all_sc) + 1, 500)
-    eer_line = None
-
-    nat = scores_by_label.get("bonafide", [])
-    syn = scores_by_label.get("synthetic", [])
-    if threshold is None and len(nat) >= 2 and len(syn) >= 2:
-        try:
-            sc      = np.array(nat + syn, dtype=np.float64)
-            lb      = np.array([0] * len(nat) + [1] * len(syn), dtype=np.int32)
-            eer_val, eer_tau, _, _ = compute_eer(sc, lb)
-            tau_d    = float(np.clip(eer_tau, sc.min(), sc.max()))
-            overflow = abs(eer_tau - tau_d) > 0.01
-            eer_line = (tau_d, eer_val, overflow)
-        except Exception:
-            pass
-
-    for label, scores in scores_by_label.items():
-        if len(scores) < 2:
-            continue
-        color = LABEL_COLORS.get(label, "#888")
-        arr   = np.array(scores, dtype=np.float64)
-        try:
-            kde = gaussian_kde(arr, bw_method="scott")
-            ys  = kde(xs)
-            ax.fill_between(xs, ys, alpha=0.2, color=color)
-            ax.plot(xs, ys, color=color, linewidth=1.5, label=label)
-            ax.plot(arr, np.full_like(arr, -0.003), "|", color=color, alpha=0.4, markersize=4)
-        except Exception:
-            pass
-
-    draw_tau = threshold if threshold is not None else (eer_line[0] if eer_line else None)
-    if draw_tau is not None:
-        if eer_line and threshold is None:
-            tau_d, eer_v, overflow = eer_line
-            lbl = (
-                f"EER threshold > obs. range (EER={eer_v * 100:.1f}%)" if overflow
-                else f"EER threshold ({tau_d:.3f}, EER={eer_v * 100:.1f}%)"
-            )
-        else:
-            lbl = f"threshold ({draw_tau:.3f})"
-        ax.axvline(draw_tau, color="#ffd166", linewidth=1.2, linestyle="--", label=lbl, zorder=4)
-
-    if suspect_cm is not None and not np.isnan(suspect_cm):
-        ax.axvline(suspect_cm, color="#000000", linewidth=1.8, linestyle="--", label="target", zorder=5)
-
-    ax.set_title(title, fontsize=9, pad=4)
-    ax.set_xlabel("CM score", fontsize=8)
-    ax.set_ylabel("Density", fontsize=8)
-    ax.tick_params(labelsize=7)
-    for sp in ax.spines.values():
-        sp.set_edgecolor("#333")
-    ax.legend(fontsize=7, facecolor="#f8f8f8", edgecolor="#333", labelcolor="#000")
-
-    if standalone:
-        fig.tight_layout()
-        return fig
 
 
 def render_cache_status_table(dataset_key: str, model_filter: list = None, expected_n: int = None) -> tuple:
@@ -973,35 +887,7 @@ def render_database() -> None:
                 st.divider()
                 continue
 
-            fig, ax = plt.subplots(figsize=(10, 3.5))
-            xs = np.linspace(min(all_sc) - 1, max(all_sc) + 1, 600)
-            for label, scores in plot_dict.items():
-                color = LABEL_COLORS.get(label, "#888")
-                arr   = np.array(scores, dtype=np.float64)
-                try:
-                    kde = gaussian_kde(arr, bw_method="scott")
-                    ys  = kde(xs)
-                    ax.fill_between(xs, ys, alpha=0.2, color=color)
-                    ax.plot(xs, ys, color=color, linewidth=1.5, label=f"{label} (n={len(scores)})")
-                    ax.plot(arr, np.full_like(arr, -0.003), "|", color=color, alpha=0.4, markersize=4)
-                except Exception:
-                    pass
-
-            if eer_info:
-                eer_val, tau_d, _ = eer_info
-                ax.axvline(
-                    tau_d, color="#ffd166", linewidth=1.2, linestyle="--",
-                    label=f"EER threshold ≈ {tau_d:.2f}  (EER={eer_val * 100:.1f}%)", zorder=4,
-                )
-
-            ax.set_title(f"Background Model — {spec.display_name}", fontsize=10)
-            ax.set_xlabel("CM score", fontsize=8)
-            ax.set_ylabel("Density", fontsize=8)
-            ax.tick_params(labelsize=7)
-            ax.legend(fontsize=7)
-            for sp in ax.spines.values():
-                sp.set_edgecolor("#333")
-            fig.tight_layout()
+            fig = kde_plot(plot_dict, title=f"Background Model — {spec.display_name}")
             st.pyplot(fig, width="stretch")
             plt.close(fig)
 
@@ -1009,7 +895,7 @@ def render_database() -> None:
             lr_values, lr_labels = compute_lr_scores(nat_cm, syn_cm)
             if lr_values is not None:
                 try:
-                    cllr_val = compute_cllr(lr_values, lr_labels)
+                    cllr_val   = compute_cllr(lr_values, lr_labels)
                 except Exception:
                     pass
 
@@ -1019,12 +905,14 @@ def render_database() -> None:
             for i, (lbl, scores) in enumerate(plot_dict.items()):
                 count_cols[i].metric(lbl, len(scores))
             col_idx = len(plot_dict)
+ 
             if eer_info:
                 count_cols[col_idx].metric("EER (utterance-level)", f"{eer_val * 100:.1f}%")
                 col_idx += 1
+ 
             if cllr_val is not None:
                 count_cols[col_idx].metric(
-                    "Cllr",
+                    "C_llr",
                     f"{cllr_val:.4f}",
                     help="Log-likelihood-ratio cost. 0 = perfect, 1 = no better than chance, >1 = miscalibrated.",
                 )
@@ -1134,46 +1022,8 @@ def render_database() -> None:
                                 st.caption("Insufficient data for EER.")
 
                     # KDE overlay per dataset.
-                    all_ds_scores = [
-                        v
-                        for ds_s in selected_specs
-                        for v in per_ds_nat.get(ds_s.key, []) + per_ds_syn.get(ds_s.key, [])
-                    ]
-                    if len(all_ds_scores) >= 4:
-                        fig_ds, ax_ds = plt.subplots(figsize=(10, 3.0))
-                        xs_ds = np.linspace(min(all_ds_scores) - 1, max(all_ds_scores) + 1, 500)
-                        ds_palette = ["#4c72b0", "#dd8452", "#55a868", "#c44e52"]
-                        for i, ds_s in enumerate(selected_specs):
-                            color = ds_palette[i % len(ds_palette)]
-                            for scores, lbl, ls in [
-                                (per_ds_nat.get(ds_s.key, []), "bonafide",  "-"),
-                                (per_ds_syn.get(ds_s.key, []), "synthetic", "--"),
-                            ]:
-                                if len(scores) < 2:
-                                    continue
-                                try:
-                                    kde_ds = gaussian_kde(
-                                        np.array(scores, dtype=np.float64),
-                                        bw_method="scott",
-                                    )
-                                    ys_ds = kde_ds(xs_ds)
-                                    ax_ds.plot(
-                                        xs_ds, ys_ds,
-                                        color=color, linewidth=1.4, linestyle=ls,
-                                        label=f"{ds_s.display_name} — {lbl} (n={len(scores)})",
-                                        alpha=0.85,
-                                    )
-                                    ax_ds.fill_between(xs_ds, ys_ds, alpha=0.07, color=color)
-                                except Exception:
-                                    pass
-                        ax_ds.set_title(f"Per-dataset KDE — {spec.display_name}", fontsize=9)
-                        ax_ds.set_xlabel("CM score", fontsize=8)
-                        ax_ds.set_ylabel("Density", fontsize=8)
-                        ax_ds.tick_params(labelsize=7)
-                        ax_ds.legend(fontsize=7, ncol=2)
-                        for sp in ax_ds.spines.values():
-                            sp.set_edgecolor("#333")
-                        fig_ds.tight_layout()
+                    fig_ds = per_dataset_kde(selected_specs, per_ds_nat, per_ds_syn)
+                    if fig_ds:
                         st.pyplot(fig_ds, width="stretch")
                         plt.close(fig_ds)
 
@@ -1439,13 +1289,272 @@ def render_analysis() -> None:
                     st.rerun()
             st.stop()
 
-    # Pipeline preview
-    with st.expander("🔊 Pipeline preview — listen before scoring", expanded=True):
+    main_tab, preview_tab, miniscoring_tab = st.tabs(["M-BM Analysis", "Preview Manipulations", "Run Scoring"])
+    
+    with main_tab:
+        # M-BM cache status and scoring
+        st.subheader("M-BM Score Cache")
+
+        current_preset_key = st.session_state.get("an_preset_key", None)
+        active_cache_key   = current_preset_key if current_preset_key is not None else pipeline_cache_key(mbm_pipeline)
+
         st.caption(
-            "One file per label class is loaded from the database and the current pipeline "
-            "is applied. Listen to originals and processed versions to sanity-check the "
-            "manipulation before running it on the full database."
+            f"Cache key: `{active_cache_key}` — "
+            f"{'preset pipeline' if current_preset_key else 'custom pipeline (hash)'}."
         )
+
+        mbm_cached     = {}
+        mbm_cache_rows = []
+        missing_models = []
+
+        for ds_an in selected_specs_an:
+            for spec in MODEL_SPECS:
+                if spec.key not in an_models:
+                    continue
+                cache_path = mbm_cache_path(ds_an.key, spec.key, active_cache_key)
+                scores     = load_mbm_cache_file(cache_path)
+                is_complete = bool(scores)
+                if is_complete:
+                    scored_at = json.loads(cache_path.read_text()).get("scored_at", "unknown")
+                    mbm_cached[spec.key] = scores
+                    mbm_cache_rows.append({
+                        "Dataset": ds_an.display_name,
+                        "Model":     spec.display_name,
+                        "Status":    "✅",
+                        "Files":     len(scores),
+                        "Scored at": scored_at,
+                        "_ds_key":   ds_an.key,
+                        "_key":      spec.key,
+                        "_complete": True,
+                    })
+                else:
+                    mbm_cache_rows.append({
+                        "Dataset": ds_an.display_name,
+                        "Model":     spec.display_name,
+                        "Status":    "❌",
+                        "Files":     None,
+                        "Scored at": "—",
+                        "_ds_key":   ds_an.key,
+                        "_key":      spec.key,
+                        "_complete": False,
+                    })
+                    missing_models.append((ds_an.key, spec.key))
+
+        st.dataframe(
+            pd.DataFrame(mbm_cache_rows).drop(columns=["_ds_key", "_key", "_complete"]),
+            use_container_width=True, hide_index=True,
+        )
+
+        col_single, col_all, col_clr = st.columns([2, 2, 1])
+
+        run_active = col_single.button(
+            f"Score active pipeline  [{active_cache_key}]"
+            + (f"  ({len(missing_models)} missing)" if missing_models else "  ✅"),
+            type="primary", disabled=len(missing_models) == 0, key="mbm_run_active",
+        )
+
+        presets_missing = [
+            (pkey, ds_an.key, spec.key)
+            for pkey in PRESET_PIPELINES
+            for ds_an in selected_specs_an
+            for spec in MODEL_SPECS
+            if spec.key in an_models
+            and not load_mbm_cache_file(mbm_cache_path(ds_an.key, spec.key, pkey))
+        ]
+        flagged_presets = list(dict.fromkeys(pkey for pkey, _, _ in presets_missing))
+
+        run_all_presets = col_all.button(
+            f"Score all presets  ({len(flagged_presets)} incomplete)",
+            disabled=len(flagged_presets) == 0, key="mbm_run_all_presets",
+        )
+
+        if col_clr.button("Clear cache", key="mbm_clr"):
+            for ds_an in selected_specs_an:
+                for spec in MODEL_SPECS:
+                    for path in [mbm_cache_path(ds_an.key, spec.key, active_cache_key),
+                                mbm_partial_path(ds_an.key, spec.key, active_cache_key)]:
+                        if path.exists():
+                            path.unlink()
+            st.session_state.an_lr_results = {}
+            st.rerun()
+
+        if run_active and missing_models:
+            if not mbm_pipeline:
+                st.warning("No pipeline steps defined.")
+            else:
+                for ds_key_missing, model_key_missing in missing_models:
+                    ds_missing = get_dataset(ds_key_missing)
+                    if not ds_missing.exists():
+                        st.error(f"Dataset path not found: {ds_missing.display_name}")
+                        continue
+                    utts_missing = st.session_state.get(f"utterances_{ds_key_missing}", {})
+                    run_mbm_scoring(
+                        mbm_pipeline, active_cache_key,
+                        [model_key_missing], ds_key_missing,
+                        ds_missing, utts_missing, an_models,
+                    )
+                st.rerun()
+
+        if run_all_presets:
+            for pkey, pinfo in PRESET_PIPELINES.items():
+                for ds_an in selected_specs_an:
+                    models_needed = [
+                        spec.key for spec in MODEL_SPECS
+                        if spec.key in an_models
+                        and not load_mbm_cache_file(mbm_cache_path(ds_an.key, spec.key, pkey))
+                    ]
+                    if not models_needed:
+                        continue
+                    if not ds_an.exists():
+                        st.error(f"Dataset path not found: {ds_an.display_name}")
+                        continue
+                    utts_an = st.session_state.get(f"utterances_{ds_an.key}", {})
+                    st.markdown(f"**{pkey}** — {pinfo['display']} ({ds_an.display_name})")
+                    run_mbm_scoring(pinfo["steps"], pkey, models_needed, ds_an.key, ds_an, utts_an, an_models)
+            st.rerun()
+
+        # Load all cached presets for downstream analysis
+        for pkey in PRESET_PIPELINES:
+            for ds_an in selected_specs_an:
+                for spec in MODEL_SPECS:
+                    if spec.key not in an_models:
+                        continue
+                    scores = load_mbm_cache_file(mbm_cache_path(ds_an.key, spec.key, pkey))
+                    if scores:
+                        mbm_cached[(pkey, spec.key)] = scores
+
+        if not mbm_cached:
+            st.info("No M-BM scores cached yet. Select a preset or build a custom pipeline, then click Score.")
+            return
+
+        pre  = st.session_state.db_cm_scores
+        post = {}
+        for model_key, scores in mbm_cached.items():
+            for uid, entry in scores.items():
+                if isinstance(entry, dict):
+                    post.setdefault(uid, []).append({"model": model_key, "cm": entry["cm"], "gt": entry["gt"]})
+
+        empty_lr = {"bonafide": [], "synthetic": [], "partial synthetic": []}
+
+        for spec in MODEL_SPECS:
+            if spec.key not in an_models or spec.key not in mbm_cached:
+                continue
+
+            st.subheader(spec.display_name)
+
+            agg_pre  = agg_scores(pre,  spec.key)
+            agg_post = agg_scores(post, spec.key)
+
+            bm_by,  bm_scores  = build_plot_and_lr_dicts(agg_pre)  if agg_pre  else ({}, empty_lr)
+            mbm_by, mbm_scores = build_plot_and_lr_dicts(agg_post) if agg_post else ({}, empty_lr)
+            st.session_state.setdefault("an_bm_scores",  {})[spec.key] = bm_scores
+            st.session_state.setdefault("an_mbm_scores", {})[spec.key] = mbm_scores
+
+            det_r     = insp_det.get(spec.key)
+            target_cm = det_r.cm_score if (det_r and not det_r.error) else None
+
+            # Side-by-side BM vs M-BM KDE
+            fig = bm_kde_sidebyside(bm_by, mbm_by, target_cm, pipe_hash)
+            st.pyplot(fig, width="stretch")
+            plt.close(fig)
+
+            # Overlay plot
+            fig2 = bm_kde_overlay(bm_by, mbm_by, target_cm)
+            if fig2:
+                st.pyplot(fig2, width="stretch")
+                plt.close(fig2)
+
+            lr_col, neighbour_col =st.columns([3,3])
+            with lr_col:
+                # LR assessment
+                if target_cm is not None:
+                    import math
+                    lr_result = compute_likelihood_ratio(target_cm, bm_scores, mbm_scores)
+                    st.session_state.an_lr_results[spec.key] = lr_result
+
+                    mc1, mc2, mc3 = st.columns(3)
+                    mc1.metric("Target CM",         round(target_cm, 4))
+                    mc2.metric("LR (authenticity)", f"{lr_result.lr_authenticity:.2e}"
+                            if lr_result.lr_authenticity is not None else "N/A")
+                    mc3.metric("LR (manipulation)", f"{lr_result.lr_manipulation:.2e}"
+                            if lr_result.lr_manipulation is not None else "N/A")
+
+                    strength_str = verbal_lr_strength(lr_result.lr_authenticity)
+                    if lr_result.lr_authenticity is not None and not math.isnan(float(lr_result.lr_authenticity or 0)):
+                        if lr_result.lr_authenticity >= 1.0:
+                            st.success(f"**Evidence strength:** {strength_str}")
+                        elif lr_result.lr_authenticity >= 0.1:
+                            st.info(f"**Evidence strength:** {strength_str}")
+                        else:
+                            st.warning(f"**Evidence strength:** {strength_str}")
+                    else:
+                        st.info(f"**Evidence strength:** {strength_str}")
+            
+                    from background_model import evaluate_synthetic_evasion
+
+                    evasion = evaluate_synthetic_evasion(bm_scores, mbm_scores)
+                    st.markdown("### Synthetic Evasion",
+                                help = "Tests whether the manipulation pipeline shifts synthetic CM scores "
+                        "toward the bonafide distribution, i.e. whether the processing "
+                        "makes synthetic speech harder to detect. A negative mean shift "
+                        "and increased overlap indicate the pipeline is consistent with "
+                        "having been applied to obfuscate synthetic content.")
+
+                    if evasion.error:
+                        st.warning(f"Evasion analysis unavailable: {evasion.error}")
+                    else:
+                        m_col1, m_col2 = st.columns(2)
+                        with m_col1:
+                            m_col1.metric(
+                            "Mean CM shift (synthetic)",
+                            f"{evasion.mean_shift:+.3f}" if evasion.mean_shift is not None else "N/A",
+                            help="Mean M-BM synthetic CM - mean BM synthetic CM. "
+                                "Negative = shifted toward bonafide = harder to detect.",
+                            )
+                            #m_col1.metric(
+                            #    "Evading BM (%)",
+                            #    f"{evasion.pct_evading_bm:.1f}%" if evasion.pct_evading_bm is not None else "N/A",
+                            #    help="% of BM synthetic scores below CM = 0 (misclassified as bonafide).",
+                            #)
+                        with m_col2:
+                            m_col2.metric(
+                                "Distribution overlap increase",
+                                f"{evasion.overlap_increase:+.4f}" if evasion.overlap_increase is not None else "N/A",
+                                help="Bhattacharyya coefficient increase between bonafide and "
+                                    "synthetic distributions. Positive = more confused.",
+                            )
+                            #m_col2.metric(
+                            #    "Evading M-BM (%)",
+                            #    f"{evasion.pct_evading_mbm:.1f}%" if evasion.pct_evading_mbm is not None else "N/A",
+                            #    help="% of M-BM synthetic scores below CM = 0.",
+                            #)
+
+                        if evasion.mean_shift is not None and evasion.mean_shift < 0:
+                            st.success(f"**{evasion.evasion_verdict}**")
+                        elif "not supported" in evasion.evasion_verdict.lower():
+                            st.warning(f"**{evasion.evasion_verdict}**")
+                        else:
+                            st.info(f"**{evasion.evasion_verdict}**")
+
+                else:
+                    st.info("Run detection on target in Stage 1 to enable LR assessment.")
+                    
+            with neighbour_col:
+                if target_cm is not None and agg_pre and agg_post:
+                    bm_nat = np.array([d["cm"] for d in agg_pre.values() if d["label"] == "bonafide"])
+                    sd_w = float(np.std(bm_nat)) if len(bm_nat) > 1 else 1
+                    nb_bm  = neighbourhood(agg_pre,  target_cm, sd_w)
+                    nb_mbm = neighbourhood(agg_post, target_cm, sd_w)
+                    fig = neighbourhood_composition(nb_bm, nb_mbm, sd_w)
+                    st.pyplot(fig, use_container_width=True)
+                    plt.close(fig)
+
+    with preview_tab:
+        # Pipeline preview
+        st.markdown("🔊 Pipeline preview",
+            help = "One file per label class is loaded from the database and the current pipeline "
+                    "is applied. Listen to originals and processed versions to sanity-check the "
+                    "manipulation before running it on the full database.")
 
         if not mbm_pipeline:
             st.info("Add manipulation steps in the sidebar to enable preview.")
@@ -1585,25 +1694,23 @@ def render_analysis() -> None:
                                 waveform_player(proc_audio, proc_sr, label="Processed")
                             dl1, dl2 = st.columns(2)
                             dl1.download_button(
-                                "⬇ Download original", data=audio_to_bytes(orig_audio, orig_sr),
+                                "Download original", data=audio_to_bytes(orig_audio, orig_sr),
                                 file_name=f"{result['uid']}_original.wav", mime="audio/wav",
                                 key=f"an_dl_orig_{label}",
                             )
                             dl2.download_button(
-                                "⬇ Download processed", data=audio_to_bytes(proc_audio, proc_sr),
+                                "Download processed", data=audio_to_bytes(proc_audio, proc_sr),
                                 file_name=f"{result['uid']}_processed.wav", mime="audio/wav",
                                 key=f"an_dl_proc_{label}",
                             )
                     st.divider()
 
-    # Mini scoring
-    with st.expander("📊 Mini scoring — rank all manipulation combinations", expanded=False):
-        st.caption(
-            "Applies every non-empty subset of the manipulations to a small stratified sample "
-            "and re-scores with the detection model. Results are ranked by mean CM shift on "
-            "synthetic files — the most negative Δ synthetic means the combination best fools "
-            "the detector. Use this to pick which pipelines to run as full MBM."
-        )
+    with miniscoring_tab:
+        st.markdown("📊 Mini scoring — rank all manipulation combinations", 
+            help= "Applies every non-empty subset of the manipulations to a small stratified sample "
+                    "and re-scores with the detection model. Results are ranked by mean CM shift on "
+                    "synthetic files; the most negative Δ synthetic means the combination best fools "
+                    "the detector. Use this to pick which pipelines to run as full MBM.")
 
         if not st.session_state.db_cm_scores:
             st.warning("No BM scores loaded. Complete Stage 0 first.")
@@ -1773,377 +1880,16 @@ def render_analysis() -> None:
                 top3_keys = df_summary.head(3)["Pipeline"].tolist()
                 for combo_key in top3_keys:
                     uid_dict = combo_results.get(combo_key, {})
-                    if not uid_dict:
-                        continue
-                    fig, ax = plt.subplots(figsize=(7, 3.2))
-                    for lbl, color in LABEL_COLORS.items():
-                        before = [v["before"] for v in uid_dict.values() if v["label"] == lbl]
-                        after  = [v["after"]  for v in uid_dict.values() if v["label"] == lbl]
-                        if len(before) < 2:
-                            continue
-                        all_vals = before + after
-                        xs = np.linspace(min(all_vals) - 0.5, max(all_vals) + 0.5, 300)
-                        try:
-                            kde_b = gaussian_kde(np.array(before, dtype=np.float64), bw_method="scott")
-                            kde_a = gaussian_kde(np.array(after,  dtype=np.float64), bw_method="scott")
-                            ax.plot(xs, kde_b(xs), color=color, linewidth=1.5, linestyle="-",  label=f"{lbl} (before)")
-                            ax.plot(xs, kde_a(xs), color=color, linewidth=1.5, linestyle="--", label=f"{lbl} (after)")
-                            ax.fill_between(xs, kde_a(xs), alpha=0.08, color=color)
-                        except Exception:
-                            pass
-                    ax.set_title(combo_key, fontsize=8)
-                    ax.set_xlabel("CM score", fontsize=7)
-                    ax.set_ylabel("Density", fontsize=7)
-                    ax.tick_params(labelsize=6)
-                    ax.legend(fontsize=6, ncol=2)
-                    for sp in ax.spines.values():
-                        sp.set_edgecolor("#333")
-                    fig.tight_layout()
-                    st.pyplot(fig, use_container_width=True)
-                    plt.close(fig)
+                    fig = combo_shift_kde(uid_dict, combo_key)
+                    if fig:
+                        st.pyplot(fig, use_container_width=True)
+                        plt.close(fig)
 
                 st.divider()
                 st.markdown(
                     "**Next step:** take the top-ranked combinations from the table above, "
                     "add those steps to the M-BM pipeline in the sidebar, and run the full M-BM Score Cache below."
                 )
-
-    # M-BM cache status and scoring
-    st.subheader("M-BM Score Cache")
-
-    current_preset_key = st.session_state.get("an_preset_key", None)
-    active_cache_key   = current_preset_key if current_preset_key is not None else pipeline_cache_key(mbm_pipeline)
-
-    st.caption(
-        f"Cache key: `{active_cache_key}` — "
-        f"{'preset pipeline' if current_preset_key else 'custom pipeline (hash)'}."
-    )
-
-    mbm_cached     = {}
-    mbm_cache_rows = []
-    missing_models = []
-
-    for ds_an in selected_specs_an:
-        for spec in MODEL_SPECS:
-            if spec.key not in an_models:
-                continue
-            cache_path = mbm_cache_path(ds_an.key, spec.key, active_cache_key)
-            scores     = load_mbm_cache_file(cache_path)
-            is_complete = bool(scores)
-            if is_complete:
-                scored_at = json.loads(cache_path.read_text()).get("scored_at", "unknown")
-                mbm_cached[spec.key] = scores
-                mbm_cache_rows.append({
-                    "Dataset": ds_an.display_name,
-                    "Model":     spec.display_name,
-                    "Status":    "✅",
-                    "Files":     len(scores),
-                    "Scored at": scored_at,
-                    "_ds_key":   ds_an.key,
-                    "_key":      spec.key,
-                    "_complete": True,
-                })
-            else:
-                mbm_cache_rows.append({
-                    "Dataset": ds_an.display_name,
-                    "Model":     spec.display_name,
-                    "Status":    "❌",
-                    "Files":     None,
-                    "Scored at": "—",
-                    "_ds_key":   ds_an.key,
-                    "_key":      spec.key,
-                    "_complete": False,
-                })
-                missing_models.append((ds_an.key, spec.key))
-
-    st.dataframe(
-        pd.DataFrame(mbm_cache_rows).drop(columns=["_ds_key", "_key", "_complete"]),
-        use_container_width=True, hide_index=True,
-    )
-
-    col_single, col_all, col_clr = st.columns([2, 2, 1])
-
-    run_active = col_single.button(
-        f"Score active pipeline  [{active_cache_key}]"
-        + (f"  ({len(missing_models)} missing)" if missing_models else "  ✅"),
-        type="primary", disabled=len(missing_models) == 0, key="mbm_run_active",
-    )
-
-    presets_missing = [
-        (pkey, ds_an.key, spec.key)
-        for pkey in PRESET_PIPELINES
-        for ds_an in selected_specs_an
-        for spec in MODEL_SPECS
-        if spec.key in an_models
-        and not load_mbm_cache_file(mbm_cache_path(ds_an.key, spec.key, pkey))
-    ]
-    flagged_presets = list(dict.fromkeys(pkey for pkey, _, _ in presets_missing))
-
-    run_all_presets = col_all.button(
-        f"Score all presets  ({len(flagged_presets)} incomplete)",
-        disabled=len(flagged_presets) == 0, key="mbm_run_all_presets",
-    )
-
-    if col_clr.button("Clear cache", key="mbm_clr"):
-        for ds_an in selected_specs_an:
-            for spec in MODEL_SPECS:
-                for path in [mbm_cache_path(ds_an.key, spec.key, active_cache_key),
-                             mbm_partial_path(ds_an.key, spec.key, active_cache_key)]:
-                    if path.exists():
-                        path.unlink()
-        st.session_state.an_lr_results = {}
-        st.rerun()
-
-    if run_active and missing_models:
-        if not mbm_pipeline:
-            st.warning("No pipeline steps defined.")
-        else:
-            for ds_key_missing, model_key_missing in missing_models:
-                ds_missing = get_dataset(ds_key_missing)
-                if not ds_missing.exists():
-                    st.error(f"Dataset path not found: {ds_missing.display_name}")
-                    continue
-                utts_missing = st.session_state.get(f"utterances_{ds_key_missing}", {})
-                run_mbm_scoring(
-                    mbm_pipeline, active_cache_key,
-                    [model_key_missing], ds_key_missing,
-                    ds_missing, utts_missing, an_models,
-                )
-            st.rerun()
-
-    if run_all_presets:
-        for pkey, pinfo in PRESET_PIPELINES.items():
-            for ds_an in selected_specs_an:
-                models_needed = [
-                    spec.key for spec in MODEL_SPECS
-                    if spec.key in an_models
-                    and not load_mbm_cache_file(mbm_cache_path(ds_an.key, spec.key, pkey))
-                ]
-                if not models_needed:
-                    continue
-                if not ds_an.exists():
-                    st.error(f"Dataset path not found: {ds_an.display_name}")
-                    continue
-                utts_an = st.session_state.get(f"utterances_{ds_an.key}", {})
-                st.markdown(f"**{pkey}** — {pinfo['display']} ({ds_an.display_name})")
-                run_mbm_scoring(pinfo["steps"], pkey, models_needed, ds_an.key, ds_an, utts_an, an_models)
-        st.rerun()
-
-    # Load all cached presets for downstream analysis
-    for pkey in PRESET_PIPELINES:
-        for ds_an in selected_specs_an:
-            for spec in MODEL_SPECS:
-                if spec.key not in an_models:
-                    continue
-                scores = load_mbm_cache_file(mbm_cache_path(ds_an.key, spec.key, pkey))
-                if scores:
-                    mbm_cached[(pkey, spec.key)] = scores
-
-    if not mbm_cached:
-        st.info("No M-BM scores cached yet. Select a preset or build a custom pipeline, then click Score.")
-        return
-
-    pre  = st.session_state.db_cm_scores
-    post = {}
-    for model_key, scores in mbm_cached.items():
-        for uid, entry in scores.items():
-            if isinstance(entry, dict):
-                post.setdefault(uid, []).append({"model": model_key, "cm": entry["cm"], "gt": entry["gt"]})
-
-    empty_lr = {"bonafide": [], "synthetic": [], "partial synthetic": []}
-
-    for spec in MODEL_SPECS:
-        if spec.key not in an_models or spec.key not in mbm_cached:
-            continue
-
-        st.subheader(spec.display_name)
-
-        agg_pre  = agg_scores(pre,  spec.key)
-        agg_post = agg_scores(post, spec.key)
-
-        bm_by,  bm_scores  = build_plot_and_lr_dicts(agg_pre)  if agg_pre  else ({}, empty_lr)
-        mbm_by, mbm_scores = build_plot_and_lr_dicts(agg_post) if agg_post else ({}, empty_lr)
-
-        det_r     = insp_det.get(spec.key)
-        target_cm = det_r.cm_score if (det_r and not det_r.error) else None
-
-        # Side-by-side BM vs M-BM KDE
-        fig, axes = plt.subplots(1, 2, figsize=(12, 3.2))
-        kde_plot(bm_by,  suspect_cm=target_cm, title="BM (original)",             ax=axes[0])
-        kde_plot(mbm_by, suspect_cm=target_cm, title=f"M-BM (hash: {pipe_hash})", ax=axes[1])
-        for ax in axes:
-            ax.tick_params(colors="#000000", labelsize=7)
-            for sp in ax.spines.values():
-                sp.set_edgecolor("#333")
-        fig.tight_layout()
-        st.pyplot(fig, width="stretch")
-        plt.close(fig)
-
-        # Overlay plot
-        all_combined = bm_by.get("bonafide", []) + bm_by.get("synthetic", []) + mbm_by.get("bonafide", []) + mbm_by.get("synthetic", [])
-        if len(all_combined) >= 4:
-            fig2, ax2 = plt.subplots(figsize=(12, 3.2))
-            xs = np.linspace(min(all_combined) - 1, max(all_combined) + 1, 600)
-            for label, scores, color, ls, lw in [
-                ("BM — bonafide",   bm_by.get("bonafide",  []), "#3ddc84", "-",  1.5),
-                ("BM — synthetic",  bm_by.get("synthetic", []), "#ff4f4f", "-",  1.5),
-                ("M-BM — bonafide", mbm_by.get("bonafide", []), "#3ddc84", "--", 1.2),
-                ("M-BM — synthetic",mbm_by.get("synthetic",[]), "#ff4f4f", "--", 1.2),
-            ]:
-                if len(scores) < 2:
-                    continue
-                try:
-                    kde = gaussian_kde(np.array(scores, dtype=np.float64), bw_method="scott")
-                    ys  = kde(xs)
-                    ax2.plot(xs, ys, color=color, linewidth=lw, linestyle=ls, label=label, alpha=0.85)
-                    ax2.fill_between(xs, ys, alpha=0.06, color=color)
-                except Exception:
-                    pass
-
-            if target_cm is not None and not np.isnan(target_cm):
-                ax2.axvline(target_cm, color="#000000", linewidth=2.0, linestyle="-",
-                            label=f"Target CM = {target_cm:.3f}", zorder=6)
-                ax2.text(target_cm + 0.15, ax2.get_ylim()[1] * 0.95,
-                         f"target\n{target_cm:.2f}", color="#000000", fontsize=7, va="top")
-
-            ax2.set_title("BM vs M-BM overlay", fontsize=9)
-            ax2.set_xlabel("CM score", fontsize=8)
-            ax2.set_ylabel("Density", fontsize=8)
-            ax2.tick_params(labelsize=7)
-            ax2.legend(fontsize=7, ncol=2)
-            for sp in ax2.spines.values():
-                sp.set_edgecolor("#333")
-            fig2.tight_layout()
-            st.pyplot(fig2, width="stretch")
-            plt.close(fig2)
-
-        # LR assessment
-        if target_cm is not None:
-            import math
-            lr_result = compute_likelihood_ratio(target_cm, bm_scores, mbm_scores)
-            st.session_state.an_lr_results[spec.key] = lr_result
-
-            mc1, mc2, mc3 = st.columns(3)
-            mc1.metric("Target CM",         round(target_cm, 4))
-            mc2.metric("LR (authenticity)", f"{lr_result.lr_authenticity:.2e}"
-                    if lr_result.lr_authenticity is not None else "N/A")
-            mc3.metric("LR (manipulation)", f"{lr_result.lr_manipulation:.2e}"
-                    if lr_result.lr_manipulation is not None else "N/A")
-
-            strength_str = verbal_lr_strength(lr_result.lr_authenticity)
-            if lr_result.lr_authenticity is not None and not math.isnan(float(lr_result.lr_authenticity or 0)):
-                if lr_result.lr_authenticity >= 1.0:
-                    st.success(f"**Evidence strength:** {strength_str}")
-                elif lr_result.lr_authenticity >= 0.1:
-                    st.info(f"**Evidence strength:** {strength_str}")
-                else:
-                    st.warning(f"**Evidence strength:** {strength_str}")
-            else:
-                st.info(f"**Evidence strength:** {strength_str}")
-    
-            from background_model import evaluate_synthetic_evasion
-
-            evasion = evaluate_synthetic_evasion(bm_scores, mbm_scores)
-            st.markdown("### Synthetic Evasion",
-                        help = "Tests whether the manipulation pipeline shifts synthetic CM scores "
-                "toward the bonafide distribution, i.e. whether the processing "
-                "makes synthetic speech harder to detect. A negative mean shift "
-                "and increased overlap indicate the pipeline is consistent with "
-                "having been applied to obfuscate synthetic content.")
-
-            if evasion.error:
-                st.warning(f"Evasion analysis unavailable: {evasion.error}")
-            else:
-                m_col1, m_col2 = st.columns(2)
-                with m_col1:
-                    m_col1.metric(
-                    "Mean CM shift (synthetic)",
-                    f"{evasion.mean_shift:+.3f}" if evasion.mean_shift is not None else "N/A",
-                    help="Mean M-BM synthetic CM - mean BM synthetic CM. "
-                        "Negative = shifted toward bonafide = harder to detect.",
-                    )
-                    #m_col1.metric(
-                    #    "Evading BM (%)",
-                    #    f"{evasion.pct_evading_bm:.1f}%" if evasion.pct_evading_bm is not None else "N/A",
-                    #    help="% of BM synthetic scores below CM = 0 (misclassified as bonafide).",
-                    #)
-                with m_col2:
-                    m_col2.metric(
-                        "Distribution overlap increase",
-                        f"{evasion.overlap_increase:+.4f}" if evasion.overlap_increase is not None else "N/A",
-                        help="Bhattacharyya coefficient increase between bonafide and "
-                            "synthetic distributions. Positive = more confused.",
-                    )
-                    #m_col2.metric(
-                    #    "Evading M-BM (%)",
-                    #    f"{evasion.pct_evading_mbm:.1f}%" if evasion.pct_evading_mbm is not None else "N/A",
-                    #    help="% of M-BM synthetic scores below CM = 0.",
-                    #)
-
-                if evasion.mean_shift is not None and evasion.mean_shift < 0:
-                    st.success(f"**{evasion.evasion_verdict}**")
-                elif "not supported" in evasion.evasion_verdict.lower():
-                    st.warning(f"**{evasion.evasion_verdict}**")
-                else:
-                    st.info(f"**{evasion.evasion_verdict}**")
-
-        else:
-            st.info("Run detection on target in Stage 1 to enable LR assessment.")
-
-        # Neighbourhood composition
-        if target_cm is not None and agg_pre and agg_post:
-            st.markdown("### Neighbourhood Composition")
-            half_w = st.slider(
-                "Window half-width (CM units)", 0.5, 5.0, 1.5, step=0.25,
-                key=f"an_neighbourhood_hw_{spec.key}",
-                help="Counts scores within [target CM - w, target CM + w].",
-            )
-
-            nb_bm  = neighbourhood(agg_pre,  target_cm, half_w)
-            nb_mbm = neighbourhood(agg_post, target_cm, half_w)
-
-            col_bm, col_mbm = st.columns(2)
-            for col, nb, label in [(col_bm, nb_bm, "BM"), (col_mbm, nb_mbm, "M-BM")]:
-                with col:
-                    st.markdown(f"**{label}** — window [{nb['lo']:.2f}, {nb['hi']:.2f}]")
-                    m1, m2, m3 = st.columns(3)
-                    m1.metric("Bonafide in window",  nb["n_nat_in"])
-                    m2.metric("Synthetic in window", nb["n_syn_in"])
-                    m3.metric("% synthetic", f"{nb['pct_syn']:.1f}%" if not np.isnan(nb["pct_syn"]) else "—")
-
-            st.divider()
-
-            rng_jitter = np.random.default_rng(42)
-            fig, axes  = plt.subplots(1, 2, figsize=(12, 3.0), sharey=False)
-            for ax, nb, title in [(axes[0], nb_bm, "BM"), (axes[1], nb_mbm, "M-BM")]:
-                nat_all = np.array(nb["nat_all"])
-                syn_all = np.array(nb["syn_all"])
-                nat_in  = np.array(nb["nat_in"])
-                syn_in  = np.array(nb["syn_in"])
-
-                def jitter(n):
-                    return rng_jitter.uniform(-0.25, 0.25, n)
-
-                if len(nat_all): ax.scatter(nat_all, jitter(len(nat_all)) + 1, color="#3ddc84", alpha=0.25, s=12, linewidths=0)
-                if len(syn_all): ax.scatter(syn_all, jitter(len(syn_all)) + 0, color="#ff4f4f", alpha=0.25, s=12, linewidths=0)
-                if len(nat_in):  ax.scatter(nat_in,  jitter(len(nat_in))  + 1, color="#3ddc84", alpha=0.9,  s=18, linewidths=0, label=f"Bonafide in window (n={len(nat_in)})")
-                if len(syn_in):  ax.scatter(syn_in,  jitter(len(syn_in))  + 0, color="#ff4f4f", alpha=0.9,  s=18, linewidths=0, label=f"Synthetic in window (n={len(syn_in)})")
-                ax.axvspan(nb["lo"], nb["hi"], alpha=0.08, color="#ffd166", zorder=0)
-                ax.axvline(target_cm, color="#000000", linewidth=2.0, linestyle="-", label=f"Target CM = {target_cm:.2f}", zorder=6)
-                ax.set_yticks([0, 1])
-                ax.set_yticklabels(["Synthetic", "Bonafide"], fontsize=8)
-                ax.set_xlabel("CM score", fontsize=8)
-                ax.set_title(title, fontsize=9)
-                ax.tick_params(labelsize=7)
-                ax.legend(fontsize=7, loc="upper left")
-                for sp in ax.spines.values():
-                    sp.set_edgecolor("#333")
-            fig.tight_layout()
-            st.pyplot(fig, width="stretch")
-            plt.close(fig)
-
-    st.divider()
-
 
 # ---------------------------------------------------------------------------
 # Routing
