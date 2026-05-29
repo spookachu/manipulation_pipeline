@@ -542,8 +542,34 @@ def stratified_sample(scoreable: list, utterances: dict, pct: int, seed: int,
 # ---------------------------------------------------------------------------
 def render_database() -> None:
     st.title("Stage 0 - Database")
-    tab_ds, tab_bm = st.tabs(["Datasets", "Background Model"])
+    tab_model, tab_ds, tab_bm = st.tabs(["Countermeasure Models","Datasets", "Background Model"])
 
+    with tab_model:
+        # Model offline cache
+        from detection import download_models, MODEL_CACHE_DIR, MODEL_SPECS
+        st.title("Available Countermeasures")
+        for spec in MODEL_SPECS:
+            with st.expander(f"{spec.key}", expanded=True):
+                dest   = MODEL_CACHE_DIR / spec.key
+                cached = dest.is_dir() and any(dest.iterdir())
+                st.markdown(
+                    f"**{spec.display_name}**:"
+                    + ("✅ cached locally" if cached else "⚠️ not cached (requires internet to load)")
+                )
+                st.caption(spec.citation)
+                st.caption(f"**Licence**:{spec.licence_url}")
+        
+        if st.button("Download all models for offline use", key="dl_models"):
+            with st.spinner("Downloading model weights..."):
+                results = download_models()
+            for key, ok in results.items():
+                if ok:
+                    st.success(f"{key} - saved to `{MODEL_CACHE_DIR / key}`")
+                else:
+                    st.error(f"{key} - download failed, check logs.")
+            st.rerun()
+            
+            
     with tab_ds:
         st.subheader("Select datasets")
         ds_options = [ds.key for ds in DATASET_REGISTRY]
@@ -1542,10 +1568,10 @@ def render_analysis() -> None:
             with neighbour_col:
                 if target_cm is not None and agg_pre and agg_post:
                     bm_nat = np.array([d["cm"] for d in agg_pre.values() if d["label"] == "bonafide"])
-                    sd_w = float(np.std(bm_nat)) if len(bm_nat) > 1 else 1
-                    nb_bm  = neighbourhood(agg_pre,  target_cm, sd_w)
-                    nb_mbm = neighbourhood(agg_post, target_cm, sd_w)
-                    fig = neighbourhood_composition(nb_bm, nb_mbm, sd_w)
+                    half_w = float(np.std(bm_nat)) if len(bm_nat) > 1 else 0.5
+                    nb_bm  = neighbourhood(agg_pre,  target_cm, half_w)
+                    nb_mbm = neighbourhood(agg_post, target_cm, half_w)
+                    fig = neighbourhood_composition(nb_bm, nb_mbm, half_w)
                     st.pyplot(fig, use_container_width=True)
                     plt.close(fig)
 

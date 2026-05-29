@@ -41,6 +41,7 @@ MIN_WINDOW_S       = 0.5
 MIN_WINDOW_SAMPLES = int(MIN_WINDOW_S * TARGET_SR)
 _PROB_EPS          = 1e-7
 CACHE_BATCH_SIZE = 50
+MODEL_CACHE_DIR = Path(__file__).parent / "model_cache"
 
 # ---------------------------------------------------------------------------
 # Model registry
@@ -56,23 +57,31 @@ class ModelSpec:
     hf_repo          : HuggingFace Hub repository string.
     target_sr        : Expected input sample rate (Hz).
     architecture     : Free-text description of the model architecture.
-    ref              : Citation / licence information.
+    citation         : Full bibliographic citation (BibTeX string).
+    licence_url      : URL to the licence file for this model.
     spoof_idx        : Output index for the spoof class (set during loading).
     bonafide_idx     : Output index for the bonafide class (set during loading).
     polarity_override: Optional (spoof_idx, bonafide_idx) to force label
                        polarity when automatic resolution fails.
     pipeline_based   : If True, load via HuggingFace pipeline API.
+    has_remote_code  : If True, the repo ships custom .py model files
+                       (trust_remote_code=True). These are copied into the
+                       transformers modules cache for offline loading.
+                       Set this for any model that is not a standard
+                       transformers architecture.
     """
     key:               str
     display_name:      str
     hf_repo:           str
     target_sr:         int
     architecture:      str
-    ref:               str
+    citation:          str
+    licence_url:       str
     spoof_idx:         int                       = -1
     bonafide_idx:      int                       = -1
     polarity_override: Optional[Tuple[int, int]] = None
     pipeline_based:    bool                      = False
+    has_remote_code:   bool                      = False
 
 
 MODEL_SPECS: List[ModelSpec] = [
@@ -81,14 +90,13 @@ MODEL_SPECS: List[ModelSpec] = [
         display_name = "DF-Arena-1B-V1",
         hf_repo      = "Speech-Arena-2025/DF_Arena_1B_V_1",
         target_sr    = TARGET_SR,
-        architecture = (
-            "~1B-parameter universal antispoofing model."
-        ),
-        ref = (
-            "Speech-Arena-2025/DF_Arena_1B_V_1 (non-commercial licence). "
-            "See https://huggingface.co/Speech-Arena-2025/DF_Arena_1B_V_1"
-        ),
-        pipeline_based = True,
+        architecture = "~1B-parameter universal antispoofing model (RAPTOR backbone).",
+        citation     = "Kulkarni, A., Dowerah, S., Kulkarni, A., Alumäe, T., & Doss, M. M. (2026). "
+       "Do Compact SSL Backbones Matter for Audio Deepfake Detection? A Controlled Study with RAPTOR. "
+        "arXiv preprint arXiv:2603.06164.",
+        licence_url     = "https://huggingface.co/Speech-Arena-2025/DF_Arena_1B_V_1/blob/main/LICENSE.txt",
+        pipeline_based  = True,
+        has_remote_code = True,
     ),
 ]
 
@@ -260,16 +268,96 @@ def _infer_one(
 # ---------------------------------------------------------------------------
 # Model loading
 # ---------------------------------------------------------------------------
+def _ensure_transformers_modules(spec: ModelSpec, local_dir: Path) -> None:
+    """Copy custom model .py files into the transformers modules cache.
+
+    Necessary because trust_remote_code=True imports custom files from
+    ~/.cache/huggingface/modules/transformers_modules/<key>/.
+    Only called for models with has_remote_code=True.
+    """
+    import shutil
+    modules_cache = (Path.home() / ".cache" / "huggingface" / "modules" / "transformers_modules" / spec.key)
+    modules_cache.mkdir(parents=True, exist_ok=True)
+    for py_file in local_dir.glob("*.py"):
+        dest = modules_cache / py_file.name
+        if not dest.exists():
+            shutil.copy2(py_file, dest)
+            logger.info("Copied %s -> %s", py_file.name, modules_cache)
+
+
+def _local_snapshot_path(spec: ModelSpec) -> "Path | None":
+    """
+    Return the local snapshot path if already downloaded, else None.
+    """
+    from huggingface_hub import snapshot_download
+    from huggingface_hub.utils import LocalEntryNotFoundError
+    try:
+        path = snapshot_download(
+            repo_id=spec.hf_repo,
+            local_dir=str(MODEL_CACHE_DIR / spec.key),
+            local_files_only=True,
+            local_dir_use_symlinks=False,
+        )
+        return Path(path)
+    except (LocalEntryNotFoundError, Exception):
+        return None
+
+
+def is_model_cached(spec: ModelSpec) -> bool:
+    """Return True if the model snapshot exists on disk."""
+    return _local_snapshot_path(spec) is not None
+
+
+def download_models(spec_keys: list | None = None) -> dict:
+    """
+    Download model weights to MODEL_CACHE_DIR for offline use.
+    """
+    from huggingface_hub import snapshot_download
+
+    MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    keys = spec_keys or [s.key for s in MODEL_SPECS]
+
+    results = {}
+    for key in keys:
+        spec = _SPEC_BY_KEY.get(key)
+        if spec is None:
+            logger.warning("download_models: unknown key %r", key)
+            results[key] = False
+            continue
+        try:
+            local_path = snapshot_download(
+                repo_id=spec.hf_repo,
+                local_dir=str(MODEL_CACHE_DIR / spec.key),
+                local_dir_use_symlinks=False,
+            )
+            if spec.has_remote_code:
+                _ensure_transformers_modules(spec, Path(local_path))
+            logger.info("Model %r ready at %s.", key, local_path)
+            results[key] = True
+        except Exception as exc:
+            logger.error("Failed to download %r: %s", key, exc)
+            results[key] = False
+    return results
+
+
 def _load_pipeline_model(spec: ModelSpec) -> _LoadedModel:
     from transformers import pipeline as hf_pipeline
     import torch
 
-    device = 0 if torch.cuda.is_available() else -1
-    pipe   = hf_pipeline(
-        "antispoofing", model=spec.hf_repo,
-        trust_remote_code=True, device=device,
+    device     = 0 if torch.cuda.is_available() else -1
+    local_path = _local_snapshot_path(spec)
+    src        = str(local_path) if local_path else spec.hf_repo
+    is_local   = local_path is not None
+
+    if is_local and spec.has_remote_code:
+        _ensure_transformers_modules(spec, local_path)
+
+    pipe = hf_pipeline(
+        "antispoofing", model=src,
+        trust_remote_code=spec.has_remote_code, device=device,
+        local_files_only=is_local,
     )
-    logger.info("Loaded pipeline model %s (device=%s).", spec.hf_repo, device)
+    logger.info("Loaded pipeline model %s from %s (device=%s).", spec.key, src, device)
     return _LoadedModel(
         pipeline_based  = True,
         pipeline        = pipe,
@@ -283,11 +371,22 @@ def _load_pipeline_model(spec: ModelSpec) -> _LoadedModel:
 def _load_classifier_model(spec: ModelSpec) -> _LoadedModel:
     from transformers import AutoFeatureExtractor, AutoModelForAudioClassification
 
-    processor = AutoFeatureExtractor.from_pretrained(spec.hf_repo)
-    model     = AutoModelForAudioClassification.from_pretrained(spec.hf_repo)
+    local_path = _local_snapshot_path(spec)
+    src        = str(local_path) if local_path else spec.hf_repo
+    is_local   = local_path is not None
+
+    if is_local and spec.has_remote_code:
+        _ensure_transformers_modules(spec, local_path)
+
+    processor = AutoFeatureExtractor.from_pretrained(
+        src, trust_remote_code=spec.has_remote_code, local_files_only=is_local,
+    )
+    model = AutoModelForAudioClassification.from_pretrained(
+        src, trust_remote_code=spec.has_remote_code, local_files_only=is_local,
+    )
     model.eval()
     si, bi, source = _resolve_label_indices(model.config.id2label, spec.polarity_override)
-    logger.info("Loaded classifier model %s (polarity: %s).", spec.hf_repo, source)
+    logger.info("Loaded classifier model %s from %s (polarity: %s).", spec.key, src, source)
     return _LoadedModel(
         pipeline_based  = False,
         model           = model,
